@@ -126,6 +126,44 @@
     return computePopoutWindowSizeFromDims(d.vw, d.vh, d.rect);
   }
 
+  // Keep requested size within the work area so Document PiP / popups are less likely to fail on huge rects.
+  function clampPopoutWindowSize(size) {
+    if (typeof screen === 'undefined' || !screen.availWidth || !screen.availHeight) {
+      return size;
+    }
+    const margin = 64;
+    const maxW = Math.max(400, screen.availWidth - margin);
+    const maxH = Math.max(220, screen.availHeight - margin);
+    return {
+      width: Math.min(Math.max(400, size.width), maxW),
+      height: Math.min(Math.max(220, size.height), maxH)
+    };
+  }
+
+  // In cross-origin iframes the API may only exist on the top window; access can throw.
+  function resolveDocumentPictureInPictureApi() {
+    try {
+      if (window.documentPictureInPicture && typeof window.documentPictureInPicture.requestWindow === 'function') {
+        return window.documentPictureInPicture;
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    try {
+      if (
+        window.top &&
+        window.top !== window &&
+        window.top.documentPictureInPicture &&
+        typeof window.top.documentPictureInPicture.requestWindow === 'function'
+      ) {
+        return window.top.documentPictureInPicture;
+      }
+    } catch (e) {
+      /* cross-origin top */
+    }
+    return null;
+  }
+
   // Utility: Check if video is visible and large enough
   function isVideoEligible(video) {
     const rect = video.getBoundingClientRect();
@@ -165,25 +203,111 @@
     );
   }
 
-  // Focus the tab that hosts this content script (not only the browser window) and scroll to the popout target.
+  // Focus the source tab (not only its window) and restore the scroll position from when the popout opened,
+  // then ensure the placeholder/video is visible. Prefer tab id captured at popout time — getCurrent() from
+  // the popout UI can resolve the wrong tab when multiple windows are open.
   function focusSourceTabAndScrollToVideo(videoId) {
+    const ent = activePopouts.get(videoId);
+    const restoreInfo = ent && ent.restoreInfo;
+
+    function restoreSavedScroll() {
+      if (!restoreInfo) {
+        return;
+      }
+      const x = restoreInfo.scrollX;
+      const y = restoreInfo.scrollY;
+      if (typeof x === 'number' && typeof y === 'number' && isFinite(x) && isFinite(y)) {
+        try {
+          window.scrollTo({ left: x, top: y, behavior: 'auto' });
+        } catch (e) {
+          try {
+            window.scrollTo(x, y);
+          } catch (e2) {
+            /* ignore */
+          }
+        }
+      }
+    }
+
     function scrollTargetIntoView() {
+      restoreSavedScroll();
       const ph = document.querySelector(`[data-video-id="${videoId}"]`);
-      const ent = activePopouts.get(videoId);
+      const ent2 = activePopouts.get(videoId);
       let el = ph;
-      if (!el && ent && ent.video && ent.video.isConnected) {
+      if (!el && ent2 && ent2.video && ent2.video.isConnected) {
         el =
-          ent.video.closest('#movie_player') ||
-          ent.video.closest('.html5-video-container') ||
-          ent.video;
+          ent2.video.closest('#movie_player') ||
+          ent2.video.closest('.html5-video-container') ||
+          ent2.video;
       }
       try {
         if (el && typeof el.scrollIntoView === 'function') {
-          el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+          // Nearest keeps the restored page scroll when the target is already visible; still scrolls if needed.
+          el.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
         }
       } catch (e) {
         /* ignore */
       }
+    }
+
+    function focusTabById(tabId, windowId) {
+      function runScrollAfterFocus() {
+        window.setTimeout(scrollTargetIntoView, 120);
+      }
+
+      function directFocusFromContentScript() {
+        if (typeof chrome === 'undefined' || !chrome.tabs || typeof chrome.tabs.update !== 'function') {
+          scrollTargetIntoView();
+          return;
+        }
+        try {
+          if (windowId != null && chrome.windows && typeof chrome.windows.update === 'function') {
+            chrome.windows.update(windowId, { focused: true });
+          }
+        } catch (e) {
+          /* ignore */
+        }
+        try {
+          chrome.tabs.update(tabId, { active: true }, function () {
+            if (chrome.runtime && chrome.runtime.lastError) {
+              scrollTargetIntoView();
+              return;
+            }
+            runScrollAfterFocus();
+          });
+        } catch (e) {
+          scrollTargetIntoView();
+        }
+      }
+
+      if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
+        try {
+          chrome.runtime.sendMessage(
+            { type: 'popout-focus-source-tab', tabId: tabId, windowId: windowId },
+            function (response) {
+              if (chrome.runtime && chrome.runtime.lastError) {
+                directFocusFromContentScript();
+                return;
+              }
+              if (response && response.ok) {
+                runScrollAfterFocus();
+              } else {
+                directFocusFromContentScript();
+              }
+            }
+          );
+        } catch (e) {
+          directFocusFromContentScript();
+        }
+        return;
+      }
+
+      directFocusFromContentScript();
+    }
+
+    if (typeof chrome !== 'undefined' && chrome.tabs && ent && ent.sourceTabId != null) {
+      focusTabById(ent.sourceTabId, ent.sourceWindowId != null ? ent.sourceWindowId : null);
+      return;
     }
 
     if (typeof chrome === 'undefined' || !chrome.tabs || typeof chrome.tabs.getCurrent !== 'function') {
@@ -197,21 +321,8 @@
           scrollTargetIntoView();
           return;
         }
-        if (tab && tab.id != null && tab.windowId != null) {
-          try {
-            if (chrome.windows && typeof chrome.windows.update === 'function') {
-              chrome.windows.update(tab.windowId, { focused: true });
-            }
-          } catch (e) {
-            /* ignore */
-          }
-          chrome.tabs.update(tab.id, { active: true }, function () {
-            if (chrome.runtime && chrome.runtime.lastError) {
-              scrollTargetIntoView();
-              return;
-            }
-            window.setTimeout(scrollTargetIntoView, 120);
-          });
+        if (tab && tab.id != null) {
+          focusTabById(tab.id, tab.windowId != null ? tab.windowId : null);
         } else {
           scrollTargetIntoView();
         }
@@ -241,6 +352,24 @@
     } catch (e) {
       console.warn('PopoutPlayer: captureStream failed', e);
       return null;
+    }
+  }
+
+  // Tab output must be nearly silent while the popout plays the mirror, or users hear echo. Do not use volume 0
+  // (often black video from captureStream) or element mute (can drop audio from the captured stream).
+  const STREAM_SOURCE_TAB_VOLUME_CAP = 0.001;
+
+  function applyStreamSourceTabDuck(video) {
+    const cap = STREAM_SOURCE_TAB_VOLUME_CAP;
+    try {
+      const v = video.volume;
+      if (v <= 0.001) {
+        video.volume = cap;
+      } else {
+        video.volume = Math.min(v, cap);
+      }
+    } catch (e) {
+      /* ignore */
     }
   }
 
@@ -581,7 +710,7 @@
     videoOverlays.set(video, { host, observer, show, hide });
   }
 
-  function popoutVideo(video, ev) {
+  function popoutVideo(video, ev, preOpenedPopup) {
     if (video._transitioning) return;
     video._transitioning = true;
     const shift = ev && ev.shiftKey === true;
@@ -589,39 +718,14 @@
     if (shift) {
       tryNativePictureInPictureFirst(video);
     } else {
-      openCustomPopoutWindow(video);
+      openCustomPopoutWindow(video, preOpenedPopup ? { preOpenedPopup: preOpenedPopup } : undefined);
     }
   }
 
-  // Popup shell: only `window.open` — then we immediately request fullscreen in the same user-gesture stack as
-  // the pop-out click so the browser can hide the title bar. Document PiP is not used: it always shows an origin
-  // strip and disallows fullscreen by spec.
-  function tryEnterFullscreenImmediately(popup) {
-    try {
-      if (!popup || popup.closed) {
-        return;
-      }
-      const doc = popup.document;
-      if (doc.fullscreenElement || doc.webkitFullscreenElement) {
-        return;
-      }
-      const root = doc && doc.documentElement;
-      if (!root) {
-        return;
-      }
-      const req = root.requestFullscreen || root.webkitRequestFullscreen;
-      if (!req) {
-        return;
-      }
-      const p = req.call(root, { navigationUI: 'hide' });
-      if (p && typeof p.then === 'function') {
-        p.catch(function () {});
-      }
-    } catch (e) {
-      /* No user activation or blocked — user can press F / double-click */
-    }
-  }
-
+  // `window.open` must run during the same user activation as the click. If it runs later (e.g. in a promise
+  // .catch after Document PiP fails), Chromium opens a normal window with full browser chrome — the “old”
+  // title bar / tab strip. Document Picture-in-Picture (Chrome 116+) opens a minimal window; when we use both,
+  // we open a reserved popup synchronously first, then close it if Doc PiP succeeds.
   function openFallbackAuxiliaryWindow(size, uniqueWinName) {
     const popFeatures = [
       'popup=yes',
@@ -640,9 +744,16 @@
     return window.open('about:blank', uniqueWinName, popFeatures);
   }
 
-  function openCustomPopoutWindow(video) {
+  function openCustomPopoutWindow(video, options) {
+    options = options || {};
+    const preOpenedPopup = options.preOpenedPopup;
     try {
       const videoId = nextVideoId++;
+
+      const size = clampPopoutWindowSize(computePopoutWindowSize(video));
+
+      const uniqueWinName =
+        'pp_' + videoId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 12);
 
       // Record restore information
       const restoreInfo = {
@@ -650,17 +761,14 @@
         nextSibling: video.nextElementSibling,
         style: video.getAttribute('style') || '',
         scrollY: window.scrollY,
-        scrollX: window.scrollX
+        scrollX: window.scrollX,
+        // Captured before any async ducking so stream-mode restore and mirror volume math stay correct.
+        prePopoutAudioSnapshot: { volume: video.volume, muted: video.muted }
       };
 
       // Many players pause the <video> when the tab blurs / goes hidden after window.open(). Snapshot intent
       // and re-assert play() after the popout is ready (with retries for async site handlers).
       const wasPlayingBeforePopout = !video.paused;
-
-      const size = computePopoutWindowSize(video);
-
-      const uniqueWinName =
-        'pp_' + videoId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 12);
 
       function startFetchAndBuild(popup) {
         if (!popup || popup.closed || typeof popup.closed === 'undefined') {
@@ -669,25 +777,50 @@
           return;
         }
 
-        tryEnterFullscreenImmediately(popup);
-        if (typeof queueMicrotask === 'function') {
-          queueMicrotask(function () {
-            tryEnterFullscreenImmediately(popup);
-          });
-        }
-
         activePopouts.set(videoId, {
           popup,
           video,
           restoreInfo,
           built: false,
-          // popup.opener may be null; keep tab window for Navigate Back.
+          // Document PiP may omit popup.opener; keep tab window for Navigate Back.
           openerWindow: window
         });
+        try {
+          if (typeof chrome !== 'undefined' && chrome.tabs && typeof chrome.tabs.getCurrent === 'function') {
+            chrome.tabs.getCurrent(function (tab) {
+              if (chrome.runtime && chrome.runtime.lastError) {
+                return;
+              }
+              const cur = activePopouts.get(videoId);
+              if (!cur || !tab || tab.id == null) {
+                return;
+              }
+              cur.sourceTabId = tab.id;
+              if (tab.windowId != null) {
+                cur.sourceWindowId = tab.windowId;
+              }
+            });
+          }
+        } catch (e) {
+          /* ignore */
+        }
         attachPlaybackHoldForPopout(videoId, video, popup, wasPlayingBeforePopout);
         installPopoutCloseWatcher(videoId);
 
         primePopupPaint(popup);
+        // Duck the in-page player as soon as we know captureStream works, so tab audio does not play at full level
+        // during CSS fetch / inject (otherwise it doubles with the popout mirror and sounds like echo).
+        const probeStream = tryCaptureStreamFromVideo(video);
+        if (probeStream) {
+          applyStreamSourceTabDuck(video);
+          try {
+            probeStream.getTracks().forEach(function (t) {
+              t.stop();
+            });
+          } catch (e) {
+            /* ignore */
+          }
+        }
         const cssUrl = safeGetExtensionUrl('player/player.css');
         if (!cssUrl) {
           cleanupAbortedPopout(videoId, video);
@@ -747,7 +880,48 @@
           });
       }
 
-      startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
+      // Toolbar path: background opened a named minimal popup via scripting.executeScript (MAIN) while the
+      // extension icon click still counts as user activation — skip Doc PiP and use that window only.
+      if (preOpenedPopup && !preOpenedPopup.closed) {
+        try {
+          if (typeof preOpenedPopup.resizeTo === 'function') {
+            preOpenedPopup.resizeTo(size.width, size.height);
+          }
+        } catch (e) {
+          /* ignore */
+        }
+        startFetchAndBuild(preOpenedPopup);
+        return;
+      }
+
+      const docPipApi = resolveDocumentPictureInPictureApi();
+      const canUseDocPip = docPipApi && typeof docPipApi.requestWindow === 'function';
+
+      if (canUseDocPip) {
+        const reservedFallback = openFallbackAuxiliaryWindow(size, uniqueWinName);
+        docPipApi
+          .requestWindow({
+            width: size.width,
+            height: size.height,
+            disallowReturnToOpener: true
+          })
+          .then(function (pipWindow) {
+            if (reservedFallback && !reservedFallback.closed) {
+              try {
+                reservedFallback.close();
+              } catch (e) {
+                /* ignore */
+              }
+            }
+            startFetchAndBuild(pipWindow);
+          })
+          .catch(function (err) {
+            console.warn('PopoutPlayer: Document PiP window unavailable, using reserved popup', err);
+            startFetchAndBuild(reservedFallback);
+          });
+      } else {
+        startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
+      }
     } catch (error) {
       if (isExtensionContextInvalidated(error)) {
         video._transitioning = false;
@@ -927,18 +1101,12 @@
 
   function finishPopoutBuild(popup, video, videoId, restoreInfo, cssText, wasPlayingBeforePopout) {
     function runBuild(stream) {
-      const savedVolume = video.volume;
-      const savedMuted = video.muted;
-      // volume===0 on the source often makes captureStream() output black video in Chrome. Duck the tab to ~silent
-      // with a small non-zero gain instead of muting (muting can also drop audio from the captured stream).
+      const snap = restoreInfo.prePopoutAudioSnapshot;
+      const savedVolume =
+        snap && typeof snap.volume === 'number' && isFinite(snap.volume) ? snap.volume : video.volume;
+      const savedMuted = snap && typeof snap.muted === 'boolean' ? snap.muted : video.muted;
       if (stream) {
-        const cap = 0.04;
-        const v = video.volume;
-        if (v <= 0.001) {
-          video.volume = cap;
-        } else {
-          video.volume = Math.min(v, cap);
-        }
+        applyStreamSourceTabDuck(video);
       }
       const prePopoutAudio = { volume: savedVolume, muted: savedMuted };
       let ui;
@@ -2116,7 +2284,21 @@
 
     const best = pickBestVideo(eligibleVideos);
     if (best) {
-      popoutVideo(best);
+      let preOpened = null;
+      if (message.toolbarPopupName) {
+        try {
+          preOpened = window[message.toolbarPopupName];
+          if (!preOpened || preOpened.closed) {
+            preOpened = window.frames[message.toolbarPopupName];
+          }
+        } catch (e) {
+          preOpened = null;
+        }
+        if (preOpened && preOpened.closed) {
+          preOpened = null;
+        }
+      }
+      popoutVideo(best, null, preOpened);
     }
   });
 
