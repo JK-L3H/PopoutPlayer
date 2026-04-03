@@ -107,7 +107,7 @@
             return;
           }
           // Check if the window.open succeeded (results[0].result will be true/false)
-          var openSucceeded = results && results[0] && results[0].result === true;
+          var openSucceeded = results && results.length > 0 && results[0] && results[0].result === true;
           chrome.tabs
             .sendMessage(tab.id, {
               type: 'popout-largest-video',

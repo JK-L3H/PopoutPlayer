@@ -7,6 +7,7 @@
   // State management
   const processedVideos = new WeakSet();
   const videoOverlays = new WeakMap();
+  const videoCleanupFunctions = new WeakMap(); // Store cleanup functions for each video
   const activePopouts = new Map(); // videoId -> { popup, restoreInfo }
   let nextVideoId = 0;
 
@@ -688,24 +689,57 @@
     }, { threshold: 0.1 });
     observer.observe(video);
 
-    // Mouse events
-    video.addEventListener('mouseenter', show);
-    video.addEventListener('mouseleave', hide);
-    button.addEventListener('mouseenter', () => clearTimeout(hideTimeout));
-    button.addEventListener('mouseleave', hide);
-
-    // YouTube: same as other sites — custom popout by default; Shift = native PiP.
-    button.addEventListener('click', (e) => {
+    // Mouse events - store references for cleanup
+    const onMouseEnter = show;
+    const onMouseLeave = hide;
+    const onButtonMouseEnter = () => clearTimeout(hideTimeout);
+    const onButtonMouseLeave = hide;
+    const onButtonClick = (e) => {
       e.stopPropagation();
       e.preventDefault();
       popoutVideo(video, e);
-    });
+    };
+
+    video.addEventListener('mouseenter', onMouseEnter);
+    video.addEventListener('mouseleave', onMouseLeave);
+    button.addEventListener('mouseenter', onButtonMouseEnter);
+    button.addEventListener('mouseleave', onButtonMouseLeave);
+    button.addEventListener('click', onButtonClick);
 
     // Append to page
     document.body.appendChild(host);
 
     // Store reference
     videoOverlays.set(video, { host, observer, show, hide });
+
+    // Create cleanup function for this video's overlay
+    const cleanupOverlay = function() {
+      // Clear any pending timeouts
+      clearTimeout(hideTimeout);
+
+      // Disconnect the IntersectionObserver
+      observer.disconnect();
+
+      // Remove all event listeners
+      video.removeEventListener('mouseenter', onMouseEnter);
+      video.removeEventListener('mouseleave', onMouseLeave);
+      button.removeEventListener('mouseenter', onButtonMouseEnter);
+      button.removeEventListener('mouseleave', onButtonMouseLeave);
+      button.removeEventListener('click', onButtonClick);
+
+      // Remove the host element from the DOM
+      if (host.isConnected) {
+        host.remove();
+      }
+
+      // Clear the WeakMap reference
+      videoOverlays.delete(video);
+    };
+
+    // Store the cleanup function
+    videoCleanupFunctions.set(video, cleanupOverlay);
+
+    return cleanupOverlay;
   }
 
   function popoutVideo(video, ev, preOpenedPopup) {
@@ -754,8 +788,14 @@
         'pp_' + videoId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 12);
 
       // Record restore information
+      const parent = video.parentElement;
+      if (!parent) {
+        video._transitioning = false;
+        showPopoutHint('Cannot pop out video: video element has no parent element.');
+        return;
+      }
       const restoreInfo = {
-        parent: video.parentElement,
+        parent: parent,
         nextSibling: video.nextElementSibling,
         style: video.getAttribute('style') || '',
         scrollY: window.scrollY,
@@ -1614,9 +1654,13 @@
       refreshTimeUi();
       const d = video.duration;
       if (video.buffered.length > 0 && isFinite(d) && d > 0) {
-        const bufferedEnd = video.buffered.end(video.buffered.length - 1);
-        const percent = (bufferedEnd / d) * 100;
-        elements.buffered.style.width = `${percent}%`;
+        try {
+          const bufferedEnd = video.buffered.end(video.buffered.length - 1);
+          const percent = (bufferedEnd / d) * 100;
+          elements.buffered.style.width = `${percent}%`;
+        } catch (e) {
+          /* ignore */
+        }
       }
     });
 
@@ -1763,12 +1807,16 @@
         case 'ArrowRight':
           e.preventDefault();
           {
-            const cap =
-              isFinite(video.duration) && video.duration > 0
-                ? video.duration
-                : video.seekable.length > 0
-                  ? video.seekable.end(video.seekable.length - 1)
-                  : 0;
+            let cap = 0;
+            if (isFinite(video.duration) && video.duration > 0) {
+              cap = video.duration;
+            } else if (video.seekable && video.seekable.length > 0) {
+              try {
+                cap = video.seekable.end(video.seekable.length - 1);
+              } catch (e) {
+                /* ignore */
+              }
+            }
             video.currentTime = Math.min(cap || 0, video.currentTime + 10);
           }
           break;
@@ -2007,10 +2055,12 @@
 
     if (streamMode) {
       document.body.appendChild(placeholder);
-    } else if (restoreInfo.nextSibling) {
-      restoreInfo.parent.insertBefore(placeholder, restoreInfo.nextSibling);
-    } else {
-      restoreInfo.parent.appendChild(placeholder);
+    } else if (restoreInfo.parent && restoreInfo.parent.isConnected) {
+      if (restoreInfo.nextSibling) {
+        restoreInfo.parent.insertBefore(placeholder, restoreInfo.nextSibling);
+      } else {
+        restoreInfo.parent.appendChild(placeholder);
+      }
     }
   }
 
@@ -2088,7 +2138,7 @@
       return;
     }
 
-    if (!restoreInfo.parent.isConnected) {
+    if (!restoreInfo.parent || !restoreInfo.parent.isConnected) {
       console.warn('PopoutPlayer: Original parent no longer exists');
       activePopouts.delete(videoId);
       return;
@@ -2310,6 +2360,14 @@
         } catch (e) {
           preOpened = null;
         }
+
+        // If toolbarPopupName was provided but we couldn't retrieve the window, something went wrong.
+        // Don't try to open a new window here (async handler, no user activation → would get full chrome).
+        if (!preOpened) {
+          best._transitioning = false;
+          showPopoutHint('Could not open from toolbar. Try clicking the pop-out icon on the video.');
+          return;
+        }
       } else {
         // toolbarPopupName is null → MAIN world window.open was blocked. Don't try to open here (no user
         // activation in async message handler → would get full chrome). Show blocked banner instead.
@@ -2322,14 +2380,28 @@
     }
   });
 
+  // Cleanup function to remove overlay for a video
+  function cleanupVideoOverlay(video) {
+    const cleanup = videoCleanupFunctions.get(video);
+    if (cleanup) {
+      try {
+        cleanup();
+      } catch (e) {
+        console.warn('PopoutPlayer: Error during overlay cleanup', e);
+      }
+      videoCleanupFunctions.delete(video);
+    }
+  }
+
   // Initial detection
   function initialize() {
     const videos = findAllVideos();
     videos.forEach(processVideo);
 
-    // Watch for new videos
+    // Watch for new videos and removed videos
     const observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
+        // Handle added nodes
         for (const node of mutation.addedNodes) {
           if (node.nodeType === Node.ELEMENT_NODE) {
             if (node.tagName === 'VIDEO') {
@@ -2340,12 +2412,37 @@
             }
           }
         }
+
+        // Handle removed nodes - cleanup overlays for removed videos
+        for (const node of mutation.removedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.tagName === 'VIDEO') {
+              cleanupVideoOverlay(node);
+            } else if (node.querySelector) {
+              // Check if the removed subtree contained any videos with overlays
+              const videos = node.querySelectorAll('video');
+              videos.forEach(cleanupVideoOverlay);
+            }
+          }
+        }
       }
     });
 
     observer.observe(document.body, {
       childList: true,
       subtree: true
+    });
+
+    // Cleanup all overlays when the page unloads
+    window.addEventListener('beforeunload', () => {
+      const allVideos = findAllVideos();
+      allVideos.forEach(cleanupVideoOverlay);
+    });
+
+    // Also cleanup on pagehide (more reliable for some browsers)
+    window.addEventListener('pagehide', () => {
+      const allVideos = findAllVideos();
+      allVideos.forEach(cleanupVideoOverlay);
     });
   }
 
