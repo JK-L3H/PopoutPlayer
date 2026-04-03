@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background gradient -->
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2196F3;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1976D2;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="128" height="128" rx="19.2" fill="url(#grad)"/>
+
+  <!-- PiP icon (simplified) -->
+  <g transform="translate(32, 32)">
+    <!-- Outer rectangle -->
+    <rect x="0" y="0" width="64" height="64"
+          fill="none" stroke="white" stroke-width="10.24" rx="6.4"/>
+    <!-- Inner rectangle (PiP window) -->
+    <rect x="19.2" y="32" width="25.6" height="19.2"
+          fill="white" rx="2.56"/>
+  </g>
+</svg>
