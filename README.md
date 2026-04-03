@@ -35,7 +35,7 @@ A Chrome extension that replicates Firefox's Picture-in-Picture feature with unl
 ### Method 2: Extension Icon
 1. Navigate to any webpage with videos
 2. Click the PopoutPlayer extension icon in your Chrome toolbar
-3. The largest visible video will pop out automatically
+3. The largest visible video will pop out automatically (on **youtube.com**, use **Method 1** for Picture-in-Picture — Chrome only allows PiP after a direct click on the page, not from the toolbar alone)
 
 ### Controls
 
@@ -56,15 +56,16 @@ A Chrome extension that replicates Firefox's Picture-in-Picture feature with unl
 
 ## How It Works
 
-PopoutPlayer uses `window.open()` to create same-origin popup windows and physically moves the `<video>` DOM element into them using `adoptNode()`. This preserves MediaSource/MSE connections (crucial for YouTube, Twitch, etc.) and allows for unlimited simultaneous popouts.
+PopoutPlayer uses `window.open()` to create same-origin popup windows and physically moves the `<video>` DOM element into them. Each popout gets a **globally unique** window name so Chrome does not reuse one window and replace another (names like `popout-player-0` are shared across tabs). This allows unlimited simultaneous popouts.
 
 **Key Technical Details:**
+- ✅ **Unlimited simultaneous popouts** on most sites — each one is a separate `window.open()`. **youtube.com** is special: moving the `<video>` into another window breaks YouTube’s player (black screen), so the extension uses **Chrome’s Picture-in-Picture** there by default (**one** PiP at a time). On YouTube, **Shift+click** the overlay to force the custom window (usually still broken).
 - ✅ Works with complex video players (YouTube, Twitch, Netflix UI)
-- ✅ Preserves video state and playback
-- ✅ No per-tab or per-session limits
+- ✅ Preserves video state and playback (custom window path)
+- ✅ No per-tab limit on **custom** PopoutPlayer windows; YouTube uses PiP (browser limit)
 - ✅ Detects videos in shadow DOM
 - ✅ Handles dynamically loaded videos
-- ⚠️ Not always-on-top (that requires Document Picture-in-Picture API, which is limited to 1 window per tab)
+- ⚠️ Popout windows are not OS “always on top” (Chrome’s separate native PiP is one-at-a-time and uses Chrome’s own UI; Shift+click on the overlay uses that path)
 - ⚠️ Popup blockers must be disabled for this site
 - ⚠️ Doesn't work with cross-origin iframe embeds (e.g., YouTube embeds on other sites - but works fine on youtube.com directly)
 
