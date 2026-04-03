@@ -44,10 +44,13 @@
   // If fetch(player.css) fails — enough to show video + controls (not blocked by page CSP)
   const POPOUT_PLAYER_CSS_FALLBACK =
     '*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:system-ui,sans-serif}' +
-    '.player-container{display:flex;flex-direction:column;width:100%;height:100%;min-height:0;position:relative;background:#000}' +
-    '.video-wrapper{flex:1 1 auto;min-height:0;display:flex;align-items:center;justify-content:center;background:#000}' +
-    '.video-wrapper video{width:100%;height:100%;object-fit:cover;object-position:center}' +
-    '.controls{position:absolute;bottom:0;left:0;right:0;padding:20px 16px 12px;z-index:10;background:linear-gradient(to top,rgba(0,0,0,.9),transparent)}' +
+    '.player-container{display:flex;flex-direction:column;width:100%;height:100%;min-height:0;position:relative;background:#000;justify-content:flex-start;align-items:stretch}' +
+    '.video-wrapper{flex:1 1 auto;min-height:0;width:100%;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}' +
+    '.video-wrapper video{display:block;width:100%;height:100%;object-fit:contain;object-position:center center}' +
+    '.popout-close-float{position:absolute;top:10px;right:10px;z-index:25;width:40px;height:40px;border:none;border-radius:8px;background:rgba(0,0,0,.55);cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;opacity:0;pointer-events:none}' +
+    '.player-container:hover .popout-close-float{opacity:1;pointer-events:auto}' +
+    '.controls{position:absolute;bottom:0;left:0;right:0;padding:20px 16px 12px;z-index:10;background:linear-gradient(to top,rgba(0,0,0,.9),transparent);transition:opacity .15s ease-out}' +
+    '.controls.hidden{opacity:0;transform:translateY(100%);pointer-events:none;transition:none}' +
     '.bottom-controls{display:flex;justify-content:space-between;align-items:center;gap:16px}' +
     '.left-controls,.right-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}' +
     '.control-btn{background:none;border:none;color:#fff;cursor:pointer;padding:8px}' +
@@ -88,40 +91,39 @@
     }
   }
 
-  // Outer popup size: match media aspect ratio when known (reduces mismatch with object-fit: cover)
-  function computePopoutWindowSize(video) {
+  function getVideoIntrinsicDimensions(video) {
+    let vw = video.videoWidth;
+    let vh = video.videoHeight;
     const rect = video.getBoundingClientRect();
-    const CONTROLS_AND_CHROME = 96;
-    const minW = 400;
-    const maxW = typeof screen !== 'undefined' ? Math.min(1920, screen.availWidth - 48) : 1280;
-    const maxH = typeof screen !== 'undefined' ? Math.min(1200, screen.availHeight - 80) : 900;
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-
-    if (vw > 0 && vh > 0) {
-      const ar = vw / vh;
-      let w = Math.min(maxW, Math.max(minW, rect.width > 0 ? Math.min(rect.width, 1280) : 960));
-      let videoH = w / ar;
-      let totalH = videoH + CONTROLS_AND_CHROME;
-      if (totalH > maxH) {
-        totalH = maxH;
-        videoH = Math.max(240, totalH - CONTROLS_AND_CHROME);
-        w = Math.max(minW, videoH * ar);
+    if (vw <= 0 || vh <= 0) {
+      if (rect.width > 0 && rect.height > 0) {
+        vw = rect.width;
+        vh = rect.height;
+      } else {
+        vw = 16;
+        vh = 9;
       }
-      if (w > maxW) {
-        w = maxW;
-        videoH = w / ar;
-        totalH = videoH + CONTROLS_AND_CHROME;
-      }
-      return {
-        width: Math.round(w),
-        height: Math.round(Math.min(maxH, Math.max(320, totalH)))
-      };
     }
+    return { vw: vw, vh: vh, rect: rect };
+  }
 
-    const width = Math.max(640, Math.min(rect.width || 800, 1280));
-    const height = Math.max(360, Math.min(rect.height + 60, 800));
-    return { width: Math.round(width), height: Math.round(height) };
+  // Initial window size from in-page video box × intrinsic aspect ratio. No clamp to screen or “100%” —
+  // the user can resize freely afterward; the player fills the window via CSS.
+  function computePopoutWindowSizeFromDims(vw, vh, rect) {
+    const minW = 400;
+    const ar = vw / vh;
+    const hintW = rect && rect.width > 0 ? rect.width : 640;
+    const w = Math.max(minW, hintW);
+    const h = w / ar;
+    return {
+      width: Math.round(w),
+      height: Math.round(Math.max(220, h))
+    };
+  }
+
+  function computePopoutWindowSize(video) {
+    const d = getVideoIntrinsicDimensions(video);
+    return computePopoutWindowSizeFromDims(d.vw, d.vh, d.rect);
   }
 
   // Utility: Check if video is visible and large enough
@@ -161,6 +163,85 @@
       h === 'm.youtube.com' ||
       h === 'music.youtube.com'
     );
+  }
+
+  // Focus the tab that hosts this content script (not only the browser window) and scroll to the popout target.
+  function focusSourceTabAndScrollToVideo(videoId) {
+    function scrollTargetIntoView() {
+      const ph = document.querySelector(`[data-video-id="${videoId}"]`);
+      const ent = activePopouts.get(videoId);
+      let el = ph;
+      if (!el && ent && ent.video && ent.video.isConnected) {
+        el =
+          ent.video.closest('#movie_player') ||
+          ent.video.closest('.html5-video-container') ||
+          ent.video;
+      }
+      try {
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    if (typeof chrome === 'undefined' || !chrome.tabs || typeof chrome.tabs.getCurrent !== 'function') {
+      scrollTargetIntoView();
+      return;
+    }
+
+    try {
+      chrome.tabs.getCurrent(function (tab) {
+        if (chrome.runtime && chrome.runtime.lastError) {
+          scrollTargetIntoView();
+          return;
+        }
+        if (tab && tab.id != null && tab.windowId != null) {
+          try {
+            if (chrome.windows && typeof chrome.windows.update === 'function') {
+              chrome.windows.update(tab.windowId, { focused: true });
+            }
+          } catch (e) {
+            /* ignore */
+          }
+          chrome.tabs.update(tab.id, { active: true }, function () {
+            if (chrome.runtime && chrome.runtime.lastError) {
+              scrollTargetIntoView();
+              return;
+            }
+            window.setTimeout(scrollTargetIntoView, 120);
+          });
+        } else {
+          scrollTargetIntoView();
+        }
+      });
+    } catch (e) {
+      scrollTargetIntoView();
+    }
+  }
+
+  // Moving <video> across documents breaks MSE/DASH (Rumble, YouTube, etc.). captureStream() keeps the
+  // decoder in-page and mirrors frames/audio into a separate <video> in the popout.
+  function tryCaptureStreamFromVideo(video) {
+    if (typeof video.captureStream !== 'function') {
+      return null;
+    }
+    try {
+      const stream = video.captureStream();
+      if (!stream || stream.getVideoTracks().length === 0) {
+        if (stream) {
+          stream.getTracks().forEach(function (t) {
+            t.stop();
+          });
+        }
+        return null;
+      }
+      return stream;
+    } catch (e) {
+      console.warn('PopoutPlayer: captureStream failed', e);
+      return null;
+    }
   }
 
   // Non-YouTube: PiP optional; may fall back to custom window. YouTube: never fall back to custom from here —
@@ -440,7 +521,7 @@
     button.className = 'popout-overlay-button hidden';
     button.innerHTML = ICONS.pip;
     button.title = isYoutubeHost()
-      ? 'YouTube: Chrome Picture-in-Picture (one at a time; moving the video here breaks playback). Shift+click: try custom window anyway (often black). Other sites: unlimited custom windows.'
+      ? 'Pop out (custom window). Shift+click: Chrome Picture-in-Picture instead (one at a time).'
       : 'Pop out (unlimited custom windows). Shift+click: Chrome Picture-in-Picture instead.';
     shadow.appendChild(button);
 
@@ -486,7 +567,7 @@
     button.addEventListener('mouseenter', () => clearTimeout(hideTimeout));
     button.addEventListener('mouseleave', hide);
 
-    // YouTube: default Chrome PiP (custom window = black). Other sites: unlimited custom windows. Shift inverts.
+    // YouTube: same as other sites — custom popout by default; Shift = native PiP.
     button.addEventListener('click', (e) => {
       e.stopPropagation();
       e.preventDefault();
@@ -500,29 +581,10 @@
     videoOverlays.set(video, { host, observer, show, hide });
   }
 
-  // youtube.com: moving <video> into about:blank breaks MSE (black screen). Default = Chrome PiP there. Other sites = unlimited custom windows.
   function popoutVideo(video, ev) {
     if (video._transitioning) return;
     video._transitioning = true;
     const shift = ev && ev.shiftKey === true;
-
-    if (isYoutubeHost()) {
-      if (shift) {
-        openCustomPopoutWindow(video);
-      } else {
-        // requestPictureInPicture() requires a recent user gesture on the page. Toolbar → sendMessage is async,
-        // so the gesture is gone — PiP always fails from the extension icon alone.
-        if (!ev) {
-          video._transitioning = false;
-          showPopoutHint(
-            'On YouTube, click the pop-out icon that appears on the video (not the extension toolbar). Chrome only allows Picture-in-Picture after a direct click on the page.'
-          );
-          return;
-        }
-        tryNativePictureInPictureFirst(video);
-      }
-      return;
-    }
 
     if (shift) {
       tryNativePictureInPictureFirst(video);
@@ -531,8 +593,54 @@
     }
   }
 
+  // Popup shell: only `window.open` — then we immediately request fullscreen in the same user-gesture stack as
+  // the pop-out click so the browser can hide the title bar. Document PiP is not used: it always shows an origin
+  // strip and disallows fullscreen by spec.
+  function tryEnterFullscreenImmediately(popup) {
+    try {
+      if (!popup || popup.closed) {
+        return;
+      }
+      const doc = popup.document;
+      if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+        return;
+      }
+      const root = doc && doc.documentElement;
+      if (!root) {
+        return;
+      }
+      const req = root.requestFullscreen || root.webkitRequestFullscreen;
+      if (!req) {
+        return;
+      }
+      const p = req.call(root, { navigationUI: 'hide' });
+      if (p && typeof p.then === 'function') {
+        p.catch(function () {});
+      }
+    } catch (e) {
+      /* No user activation or blocked — user can press F / double-click */
+    }
+  }
+
+  function openFallbackAuxiliaryWindow(size, uniqueWinName) {
+    const popFeatures = [
+      'popup=yes',
+      'width=' + size.width,
+      'height=' + size.height,
+      'left=' + Math.max(0, Math.round((screen.availWidth - size.width) / 2)),
+      'top=' + Math.max(0, Math.round((screen.availHeight - size.height) / 2)),
+      'resizable=yes',
+      'scrollbars=no',
+      'toolbar=no',
+      'menubar=no',
+      'location=no',
+      'status=no',
+      'directories=no'
+    ].join(',');
+    return window.open('about:blank', uniqueWinName, popFeatures);
+  }
+
   function openCustomPopoutWindow(video) {
-    let popup = null;
     try {
       const videoId = nextVideoId++;
 
@@ -545,101 +653,104 @@
         scrollX: window.scrollX
       };
 
+      // Many players pause the <video> when the tab blurs / goes hidden after window.open(). Snapshot intent
+      // and re-assert play() after the popout is ready (with retries for async site handlers).
+      const wasPlayingBeforePopout = !video.paused;
+
       const size = computePopoutWindowSize(video);
 
-      // Window names are browser-global: reusing e.g. popout-player-0 replaces an older popout. Always use a unique name.
       const uniqueWinName =
         'pp_' + videoId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 12);
 
-      // Normal auxiliary window (no `popup` feature — stacks like any other window, not a minimal always-raised chrome)
-      popup = window.open(
-        'about:blank',
-        uniqueWinName,
-        `width=${size.width},height=${size.height},resizable=yes,scrollbars=no`
-      );
-
-      // Check if popup was blocked
-      if (!popup || popup.closed || typeof popup.closed === 'undefined') {
-        showPopupBlockedBanner(video);
-        video._transitioning = false;
-        return;
-      }
-
-      // CSP on sites like YouTube blocks <link href="chrome-extension://..."> in child about:blank.
-      // Fetch CSS in the extension context, then inject as <style> text (allowed).
-      primePopupPaint(popup);
-      const cssUrl = safeGetExtensionUrl('player/player.css');
-      if (!cssUrl) {
-        video._transitioning = false;
-        try {
-          popup.close();
-        } catch (e) {
-          /* ignore */
+      function startFetchAndBuild(popup) {
+        if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+          showPopupBlockedBanner(video);
+          video._transitioning = false;
+          return;
         }
-        showPopoutHint('PopoutPlayer was reloaded or updated. Refresh this page (F5), then try again.');
-        return;
-      }
-      fetch(cssUrl)
-        .then(function (response) {
-          if (!response.ok) {
-            throw new Error('HTTP ' + response.status);
-          }
-          return response.text();
-        })
-        .then(function (cssText) {
-          if (popup.closed) {
-            video._transitioning = false;
-            return;
-          }
-          runWhenPopupReady(popup, function () {
-            try {
-              buildPlayerUI(popup, video, videoId, restoreInfo, cssText);
-              activePopouts.set(videoId, { popup, restoreInfo, video });
-              createPlaceholder(video, restoreInfo, videoId);
-            } catch (error) {
-              console.error('PopoutPlayer: Failed to create popout', error);
-              video._transitioning = false;
-              try {
-                popup.close();
-              } catch (e) {
-                /* ignore */
-              }
-            }
-          });
-        })
-        .catch(function (err) {
-          console.warn('PopoutPlayer: using fallback CSS', err);
-          if (popup.closed) {
-            video._transitioning = false;
-            return;
-          }
-          runWhenPopupReady(popup, function () {
-            try {
-              buildPlayerUI(popup, video, videoId, restoreInfo, POPOUT_PLAYER_CSS_FALLBACK);
-              activePopouts.set(videoId, { popup, restoreInfo, video });
-              createPlaceholder(video, restoreInfo, videoId);
-            } catch (error) {
-              console.error('PopoutPlayer: Failed to create popout', error);
-              video._transitioning = false;
-              try {
-                popup.close();
-              } catch (e) {
-                /* ignore */
-              }
-            }
-          });
-        });
 
+        tryEnterFullscreenImmediately(popup);
+        if (typeof queueMicrotask === 'function') {
+          queueMicrotask(function () {
+            tryEnterFullscreenImmediately(popup);
+          });
+        }
+
+        activePopouts.set(videoId, {
+          popup,
+          video,
+          restoreInfo,
+          built: false,
+          // popup.opener may be null; keep tab window for Navigate Back.
+          openerWindow: window
+        });
+        attachPlaybackHoldForPopout(videoId, video, popup, wasPlayingBeforePopout);
+        installPopoutCloseWatcher(videoId);
+
+        primePopupPaint(popup);
+        const cssUrl = safeGetExtensionUrl('player/player.css');
+        if (!cssUrl) {
+          cleanupAbortedPopout(videoId, video);
+          try {
+            popup.close();
+          } catch (e) {
+            /* ignore */
+          }
+          showPopoutHint('PopoutPlayer was reloaded or updated. Refresh this page (F5), then try again.');
+          return;
+        }
+        fetch(cssUrl)
+          .then(function (response) {
+            if (!response.ok) {
+              throw new Error('HTTP ' + response.status);
+            }
+            return response.text();
+          })
+          .then(function (cssText) {
+            if (popup.closed) {
+              cleanupAbortedPopout(videoId, video);
+              return;
+            }
+            runWhenPopupReady(popup, function () {
+              try {
+                finishPopoutBuild(popup, video, videoId, restoreInfo, cssText, wasPlayingBeforePopout);
+              } catch (error) {
+                console.error('PopoutPlayer: Failed to create popout', error);
+                cleanupAbortedPopout(videoId, video);
+                try {
+                  popup.close();
+                } catch (e) {
+                  /* ignore */
+                }
+              }
+            });
+          })
+          .catch(function (err) {
+            console.warn('PopoutPlayer: using fallback CSS', err);
+            if (popup.closed) {
+              cleanupAbortedPopout(videoId, video);
+              return;
+            }
+            runWhenPopupReady(popup, function () {
+              try {
+                finishPopoutBuild(popup, video, videoId, restoreInfo, POPOUT_PLAYER_CSS_FALLBACK, wasPlayingBeforePopout);
+              } catch (error) {
+                console.error('PopoutPlayer: Failed to create popout', error);
+                cleanupAbortedPopout(videoId, video);
+                try {
+                  popup.close();
+                } catch (e) {
+                  /* ignore */
+                }
+              }
+            });
+          });
+      }
+
+      startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
     } catch (error) {
       if (isExtensionContextInvalidated(error)) {
         video._transitioning = false;
-        try {
-          if (popup && !popup.closed) {
-            popup.close();
-          }
-        } catch (e) {
-          /* ignore */
-        }
         showPopoutHint('PopoutPlayer was reloaded or updated. Refresh this page (F5), then try again.');
         return;
       }
@@ -648,8 +759,267 @@
     }
   }
 
+  function clearPopoutCloseWatcher(ent) {
+    if (ent && ent.closePollId) {
+      try {
+        window.clearInterval(ent.closePollId);
+      } catch (e) {
+        /* ignore */
+      }
+      ent.closePollId = 0;
+    }
+  }
+
+  function installPopoutCloseWatcher(videoId) {
+    const ent = activePopouts.get(videoId);
+    if (!ent || !ent.popup) {
+      return;
+    }
+    clearPopoutCloseWatcher(ent);
+    let pollId = 0;
+    pollId = window.setInterval(function () {
+      const cur = activePopouts.get(videoId);
+      if (!cur) {
+        window.clearInterval(pollId);
+        return;
+      }
+      try {
+        if (cur.popup.closed) {
+          window.clearInterval(pollId);
+          cur.closePollId = 0;
+          restoreVideo(videoId);
+        }
+      } catch (e) {
+        window.clearInterval(pollId);
+        cur.closePollId = 0;
+        restoreVideo(videoId);
+      }
+    }, 250);
+    ent.closePollId = pollId;
+  }
+
+  function cleanupAbortedPopout(videoId, video) {
+    const ent = activePopouts.get(videoId);
+    clearPopoutCloseWatcher(ent);
+    if (ent && typeof ent.releasePlaybackHold === 'function') {
+      ent.releasePlaybackHold();
+    }
+    activePopouts.delete(videoId);
+    if (video) {
+      try {
+        video._transitioning = false;
+      } catch (e) {
+        /* ignore */
+      }
+    }
+  }
+
+  function resumePlaybackAfterPopout(video, shouldResume) {
+    if (!shouldResume) {
+      return;
+    }
+    function tryPlay() {
+      try {
+        if (video.paused) {
+          const p = video.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch(function () {});
+          }
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    tryPlay();
+    window.setTimeout(tryPlay, 0);
+    window.setTimeout(tryPlay, 50);
+    window.setTimeout(tryPlay, 150);
+    window.setTimeout(tryPlay, 400);
+  }
+
+  // Sites often pause the <video> after the tab blurs (async, after our first play() calls). Re-assert playback
+  // while keepPlayingIntent is true; cleared when the user hits pause in our popout or the window closes.
+  function attachPlaybackHoldForPopout(videoId, video, popup, wasPlayingBeforePopout) {
+    const info = activePopouts.get(videoId);
+    if (!info) {
+      return;
+    }
+    if (typeof info.releasePlaybackHold === 'function') {
+      info.releasePlaybackHold();
+    }
+    info.keepPlayingIntent = !!wasPlayingBeforePopout;
+
+    function tryResumeOnce() {
+      if (!info.keepPlayingIntent) {
+        return;
+      }
+      if (popup.closed || !activePopouts.has(videoId)) {
+        return;
+      }
+      try {
+        if (video.paused) {
+          const p = video.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch(function () {});
+          }
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    function onSourcePause() {
+      if (!info.keepPlayingIntent) {
+        return;
+      }
+      window.setTimeout(tryResumeOnce, 0);
+      window.setTimeout(tryResumeOnce, 30);
+      window.setTimeout(tryResumeOnce, 100);
+      window.setTimeout(tryResumeOnce, 250);
+    }
+
+    function onVisibilityChange() {
+      if (!info.keepPlayingIntent || !document.hidden) {
+        return;
+      }
+      window.setTimeout(tryResumeOnce, 0);
+      window.setTimeout(tryResumeOnce, 80);
+    }
+
+    video.addEventListener('pause', onSourcePause);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    let holdIntervalId = 0;
+    if (wasPlayingBeforePopout) {
+      let ticks = 0;
+      holdIntervalId = window.setInterval(function () {
+        if (!activePopouts.has(videoId) || popup.closed) {
+          window.clearInterval(holdIntervalId);
+          holdIntervalId = 0;
+          return;
+        }
+        if (!info.keepPlayingIntent) {
+          window.clearInterval(holdIntervalId);
+          holdIntervalId = 0;
+          return;
+        }
+        if (video.paused) {
+          tryResumeOnce();
+        }
+        if (++ticks > 300) {
+          window.clearInterval(holdIntervalId);
+          holdIntervalId = 0;
+        }
+      }, 100);
+    }
+
+    info.releasePlaybackHold = function () {
+      video.removeEventListener('pause', onSourcePause);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (holdIntervalId) {
+        window.clearInterval(holdIntervalId);
+        holdIntervalId = 0;
+      }
+    };
+
+    resumePlaybackAfterPopout(video, wasPlayingBeforePopout);
+  }
+
+  function finishPopoutBuild(popup, video, videoId, restoreInfo, cssText, wasPlayingBeforePopout) {
+    function runBuild(stream) {
+      const savedVolume = video.volume;
+      const savedMuted = video.muted;
+      // volume===0 on the source often makes captureStream() output black video in Chrome. Duck the tab to ~silent
+      // with a small non-zero gain instead of muting (muting can also drop audio from the captured stream).
+      if (stream) {
+        const cap = 0.04;
+        const v = video.volume;
+        if (v <= 0.001) {
+          video.volume = cap;
+        } else {
+          video.volume = Math.min(v, cap);
+        }
+      }
+      const prePopoutAudio = { volume: savedVolume, muted: savedMuted };
+      let ui;
+      try {
+        ui = buildPlayerUI(popup, video, videoId, restoreInfo, cssText, stream, prePopoutAudio);
+      } catch (buildErr) {
+        if (stream) {
+          try {
+            video.volume = savedVolume;
+            video.muted = savedMuted;
+          } catch (e) {
+            /* ignore */
+          }
+          try {
+            stream.getTracks().forEach(function (t) {
+              t.stop();
+            });
+          } catch (e2) {
+            /* ignore */
+          }
+        }
+        throw buildErr;
+      }
+      const ent = activePopouts.get(videoId);
+      if (ent) {
+        Object.assign(ent, {
+          mode: stream ? 'stream' : 'moved',
+          stream: stream || null,
+          displayVideo: ui.displayVideo,
+          savedVolume: savedVolume,
+          savedMuted: savedMuted,
+          // What to restore on the in-page <video> when closing (kept in sync while popout is open).
+          integratedVolume: savedVolume,
+          integratedMuted: savedMuted,
+          built: true
+        });
+      } else {
+        activePopouts.set(videoId, {
+          popup,
+          restoreInfo,
+          video,
+          mode: stream ? 'stream' : 'moved',
+          stream: stream || null,
+          displayVideo: ui.displayVideo,
+          savedVolume: savedVolume,
+          savedMuted: savedMuted,
+          integratedVolume: savedVolume,
+          integratedMuted: savedMuted,
+          built: true,
+          openerWindow: window
+        });
+        attachPlaybackHoldForPopout(videoId, video, popup, wasPlayingBeforePopout);
+      }
+      createPlaceholder(video, restoreInfo, videoId, !!stream);
+    }
+
+    let stream = tryCaptureStreamFromVideo(video);
+    if (stream) {
+      runBuild(stream);
+      return;
+    }
+    if (video.paused) {
+      const p = video.play();
+      if (p && typeof p.then === 'function') {
+        p.then(function () {
+          runBuild(tryCaptureStreamFromVideo(video) || null);
+        }).catch(function () {
+          runBuild(null);
+        });
+        return;
+      }
+    }
+    runBuild(null);
+  }
+
   // Build player UI in popup window (cssText from fetch — not <link>, so page CSP cannot block it)
-  function buildPlayerUI(popup, video, videoId, restoreInfo, cssText) {
+  // prePopoutAudio: volume/muted on the in-page player *before* any ducking (stream mode) — keeps popout level matched.
+  function buildPlayerUI(popup, video, videoId, restoreInfo, cssText, stream, prePopoutAudio) {
+    if (!prePopoutAudio) {
+      prePopoutAudio = { volume: video.volume, muted: video.muted };
+    }
     const doc = popup.document;
     ensurePopupDocStructure(doc);
 
@@ -673,16 +1043,93 @@
     const videoWrapper = doc.createElement('div');
     videoWrapper.className = 'video-wrapper';
 
-    // Move <video> into the popup (appendChild across documents adopts automatically)
-    videoWrapper.appendChild(video);
-    // YouTube often sets pointer-events:none on the player; controls must receive clicks
-    video.style.setProperty('pointer-events', 'auto', 'important');
-    video.removeAttribute('inert');
-    video.setAttribute('playsinline', '');
-    videoWrapper.style.position = 'relative';
-    videoWrapper.style.zIndex = '0';
+    let displayVideo = null;
+    if (stream) {
+      displayVideo = doc.createElement('video');
+      displayVideo.setAttribute('playsinline', '');
+      displayVideo.playsInline = true;
+      displayVideo.autoplay = true;
+      displayVideo.style.cssText =
+        'display:block;width:100%;height:100%;object-fit:contain;object-position:center center;pointer-events:auto';
+      displayVideo.srcObject = stream;
+      videoWrapper.appendChild(displayVideo);
+      // Source is ducked (video.volume = small cap). Stream audio scales with that; compensate on displayVideo so
+      // perceived loudness matches prePopoutAudio (same as built-in player before popout).
+      function applyMirrorOutputVolume() {
+        const duck = video.volume;
+        const target = prePopoutAudio.volume;
+        const wasMuted = prePopoutAudio.muted;
+        try {
+          if (wasMuted) {
+            displayVideo.muted = true;
+            displayVideo.volume = Math.min(1, Math.max(0, target));
+          } else {
+            displayVideo.muted = false;
+            displayVideo.volume = Math.min(1, target / Math.max(duck, 1e-6));
+          }
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      // New auxiliary windows often fail unmuted play() (autoplay policy). Start muted, then unmute after playback begins.
+      function removeFirstPointerKick() {
+        try {
+          popup.document.removeEventListener('pointerdown', onFirstPointer, true);
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      function onFirstPointer() {
+        try {
+          displayVideo.muted = true;
+          displayVideo
+            .play()
+            .then(function () {
+              applyMirrorOutputVolume();
+              removeFirstPointerKick();
+            })
+            .catch(function () {});
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      function kickDisplayVideo() {
+        displayVideo.muted = true;
+        const playP = displayVideo.play();
+        if (playP && typeof playP.then === 'function') {
+          playP
+            .then(function () {
+              applyMirrorOutputVolume();
+              removeFirstPointerKick();
+            })
+            .catch(function (err) {
+              console.warn('PopoutPlayer: popout mirror play failed', err);
+            });
+        }
+      }
+      kickDisplayVideo();
+      // If autoplay was blocked, first click anywhere in the popout starts the mirror.
+      popup.document.addEventListener('pointerdown', onFirstPointer, true);
+      videoWrapper.style.position = 'relative';
+      videoWrapper.style.zIndex = '0';
+    } else {
+      // Move <video> into the popup (appendChild across documents adopts automatically)
+      videoWrapper.appendChild(video);
+      video.style.setProperty('pointer-events', 'auto', 'important');
+      video.removeAttribute('inert');
+      video.setAttribute('playsinline', '');
+      videoWrapper.style.position = 'relative';
+      videoWrapper.style.zIndex = '0';
+    }
 
-    container.appendChild(videoWrapper);
+    // Close lives here (top-right, hover) — not in the bottom bar.
+    const closeFloatBtn = doc.createElement('button');
+    closeFloatBtn.type = 'button';
+    closeFloatBtn.className = 'popout-close-float';
+    closeFloatBtn.setAttribute('aria-label', 'Close and restore video');
+    closeFloatBtn.innerHTML = ICONS.close;
+    closeFloatBtn.title = 'Close and restore video';
+    videoWrapper.appendChild(closeFloatBtn);
 
     // Controls container
     const controls = doc.createElement('div');
@@ -750,7 +1197,8 @@
 
     const volumeBtn = doc.createElement('button');
     volumeBtn.className = 'control-btn';
-    volumeBtn.innerHTML = video.muted || video.volume === 0 ? ICONS.volumeMute : ICONS.volumeUp;
+    volumeBtn.innerHTML =
+      prePopoutAudio.muted || prePopoutAudio.volume === 0 ? ICONS.volumeMute : ICONS.volumeUp;
     volumeBtn.title = 'Mute (M)';
     rightControls.appendChild(volumeBtn);
 
@@ -759,7 +1207,7 @@
     volumeSlider.className = 'volume-slider';
     volumeSlider.min = '0';
     volumeSlider.max = '100';
-    volumeSlider.value = String(video.volume * 100);
+    volumeSlider.value = String(Math.round(prePopoutAudio.volume * 100));
     rightControls.appendChild(volumeSlider);
 
     const navigateBackBtn = doc.createElement('button');
@@ -769,19 +1217,14 @@
     navigateBackBtn.textContent = 'Navigate Back';
     rightControls.appendChild(navigateBackBtn);
 
-    const closeBtn = doc.createElement('button');
-    closeBtn.className = 'control-btn close';
-    closeBtn.innerHTML = ICONS.close;
-    closeBtn.title = 'Close and restore video';
-    rightControls.appendChild(closeBtn);
-
     bottomControls.appendChild(rightControls);
     controls.appendChild(bottomControls);
-    container.appendChild(controls);
+    videoWrapper.appendChild(controls);
+    container.appendChild(videoWrapper);
 
     doc.body.appendChild(container);
 
-    // Wire up controls
+    // Wire up controls (source `video` stays in the page when stream mirroring)
     wireUpControls(popup, video, videoId, {
       playPauseBtn,
       skipBackBtn,
@@ -793,17 +1236,89 @@
       volumeBtn,
       volumeSlider,
       navigateBackBtn,
-      closeBtn,
+      closeBtn: closeFloatBtn,
       controls,
-      videoWrapper
+      videoWrapper,
+      playerContainer: container
+    }, {
+      displayVideo: displayVideo,
+      duckLevel: stream ? video.volume : null,
+      prePopoutAudio: prePopoutAudio
     });
+
+    return { displayVideo: displayVideo, videoWrapper: videoWrapper };
   }
 
   // Wire up player controls
-  function wireUpControls(popup, video, videoId, elements) {
+  function wireUpControls(popup, video, videoId, elements, opts) {
+    opts = opts || {};
+    const displayVideo = opts.displayVideo;
+    const duckLevel = opts.duckLevel;
+    const prePopoutAudio = opts.prePopoutAudio || { volume: video.volume, muted: video.muted };
+    const volumeTarget = displayVideo || video;
+    let logicalVolume = prePopoutAudio.volume;
+    const uiVideo = displayVideo || video;
     const doc = popup.document;
-    let hideControlsTimeout;
     let isScrubbing = false;
+
+    function persistIntegratedAudioState() {
+      const ent = activePopouts.get(videoId);
+      if (!ent) {
+        return;
+      }
+      try {
+        if (duckLevel != null) {
+          ent.integratedVolume = logicalVolume;
+          ent.integratedMuted = !!volumeTarget.muted;
+        } else {
+          ent.integratedVolume = video.volume;
+          ent.integratedMuted = !!video.muted;
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    // captureStream mirror: UI time comes from the source, but the popout <video> must be playing or frames freeze.
+    let mirrorSyncIntervalId = 0;
+    if (displayVideo) {
+      function syncMirrorPlayback() {
+        if (!displayVideo.srcObject) {
+          return;
+        }
+        if (video.paused) {
+          displayVideo.pause();
+          return;
+        }
+        if (displayVideo.paused) {
+          try {
+            displayVideo.muted = false;
+          } catch (e) {
+            /* ignore */
+          }
+          const p = displayVideo.play();
+          if (p && typeof p.catch === 'function') {
+            p.catch(function () {});
+          }
+        }
+      }
+      video.addEventListener('play', syncMirrorPlayback);
+      video.addEventListener('playing', syncMirrorPlayback);
+      video.addEventListener('pause', syncMirrorPlayback);
+      video.addEventListener('seeked', syncMirrorPlayback);
+      video.addEventListener('ratechange', syncMirrorPlayback);
+      syncMirrorPlayback();
+      mirrorSyncIntervalId = window.setInterval(syncMirrorPlayback, 80);
+      function clearMirrorSync() {
+        if (!mirrorSyncIntervalId) {
+          return;
+        }
+        window.clearInterval(mirrorSyncIntervalId);
+        mirrorSyncIntervalId = 0;
+      }
+      popup.addEventListener('pagehide', clearMirrorSync, { once: true });
+      popup.addEventListener('beforeunload', clearMirrorSync, { once: true });
+    }
 
     function durationLabel() {
       const d = video.duration;
@@ -838,7 +1353,11 @@
     }
 
     function togglePlayback() {
+      const pop = activePopouts.get(videoId);
       if (video.paused) {
+        if (pop) {
+          pop.keepPlayingIntent = true;
+        }
         const p = video.play();
         if (p && typeof p.catch === 'function') {
           p.catch(function () {
@@ -846,6 +1365,9 @@
           });
         }
       } else {
+        if (pop) {
+          pop.keepPlayingIntent = false;
+        }
         video.pause();
       }
     }
@@ -861,7 +1383,7 @@
       true
     );
 
-    video.addEventListener('click', function (e) {
+    uiVideo.addEventListener('click', function (e) {
       e.preventDefault();
       togglePlayback();
     });
@@ -932,33 +1454,69 @@
       }
     });
 
-    // Volume
+    // Volume: stream mirror uses displayVideo gain; logical 0–1 matches the in-page slider before popout.
+    function applyStreamMirrorVolume() {
+      if (duckLevel == null) {
+        return;
+      }
+      if (volumeTarget.muted) {
+        return;
+      }
+      try {
+        volumeTarget.volume = Math.min(1, logicalVolume / Math.max(duckLevel, 1e-6));
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    function refreshVolumeUi() {
+      const silent =
+        volumeTarget.muted ||
+        (duckLevel != null ? logicalVolume < 0.001 : volumeTarget.volume < 0.001);
+      elements.volumeBtn.innerHTML = silent ? ICONS.volumeMute : ICONS.volumeUp;
+      if (!volumeTarget.muted) {
+        if (duckLevel != null) {
+          elements.volumeSlider.value = String(Math.round(logicalVolume * 100));
+        } else {
+          elements.volumeSlider.value = String(Math.round(volumeTarget.volume * 100));
+        }
+      }
+    }
+
     elements.volumeBtn.addEventListener('click', () => {
-      video.muted = !video.muted;
+      if (duckLevel != null) {
+        volumeTarget.muted = !volumeTarget.muted;
+        if (!volumeTarget.muted) {
+          applyStreamMirrorVolume();
+        }
+      } else {
+        video.muted = !video.muted;
+      }
+      refreshVolumeUi();
+      persistIntegratedAudioState();
     });
 
     elements.volumeSlider.addEventListener('input', () => {
-      video.volume = elements.volumeSlider.value / 100;
-      video.muted = false;
-    });
-
-    video.addEventListener('volumechange', () => {
-      elements.volumeBtn.innerHTML = video.muted || video.volume === 0 ? ICONS.volumeMute : ICONS.volumeUp;
-      if (!video.muted) {
-        elements.volumeSlider.value = String(video.volume * 100);
+      logicalVolume = elements.volumeSlider.value / 100;
+      if (duckLevel != null) {
+        volumeTarget.muted = false;
+        applyStreamMirrorVolume();
+      } else {
+        video.volume = logicalVolume;
+        video.muted = false;
       }
+      refreshVolumeUi();
+      persistIntegratedAudioState();
     });
 
-    // Navigate back (must use popup.opener — content script window.opener is not the tab opener)
+    volumeTarget.addEventListener('volumechange', function () {
+      refreshVolumeUi();
+      persistIntegratedAudioState();
+    });
+
+    // Navigate back: activate the source tab (not only its window) and scroll to the video / placeholder.
     elements.navigateBackBtn.addEventListener('click', () => {
-      const openerWin = popup.opener;
-      if (openerWin && !openerWin.closed) {
-        openerWin.postMessage({
-          type: 'popout-navigate-back',
-          videoId: videoId
-        }, '*');
-        openerWin.focus();
-      }
+      focusSourceTabAndScrollToVideo(videoId);
     });
 
     // Close
@@ -966,11 +1524,66 @@
       popup.close();
     });
 
+    // Fullscreen hides the OS/browser window frame when the browser allows it. Document PiP windows often reject
+    // this (security); classic `window.open` popups usually allow it — use F or double-click the video area.
+    function togglePopoutFullscreen() {
+      const doc = popup.document;
+      const root = doc.documentElement;
+      const fsEl = doc.fullscreenElement || doc.webkitFullscreenElement;
+      try {
+        if (fsEl) {
+          if (doc.exitFullscreen) {
+            doc.exitFullscreen();
+          } else if (doc.webkitExitFullscreen) {
+            doc.webkitExitFullscreen();
+          }
+        } else {
+          const req = root.requestFullscreen || root.webkitRequestFullscreen;
+          if (req) {
+            req.call(root, { navigationUI: 'hide' });
+          }
+        }
+      } catch (err) {
+        /* PiP or policy may block fullscreen */
+      }
+    }
+
+    elements.videoWrapper.addEventListener(
+      'dblclick',
+      function (e) {
+        if (e.target.closest('button') || e.target.closest('input')) {
+          return;
+        }
+        e.preventDefault();
+        togglePopoutFullscreen();
+      },
+      true
+    );
+
     // Keyboard shortcuts (click the popout once so it has focus for keys)
     function onKeydown(e) {
       if (e.target.tagName === 'INPUT') return;
 
       switch (e.key) {
+        case 'Escape': {
+          e.preventDefault();
+          const doc = popup.document;
+          if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+            if (doc.exitFullscreen) {
+              doc.exitFullscreen();
+            } else if (doc.webkitExitFullscreen) {
+              doc.webkitExitFullscreen();
+            }
+          } else {
+            popup.close();
+          }
+          break;
+        }
+        case 'f':
+        case 'F':
+          e.preventDefault();
+          togglePopoutFullscreen();
+          break;
         case ' ':
         case 'k':
         case 'K':
@@ -995,80 +1608,206 @@
           break;
         case 'ArrowUp':
           e.preventDefault();
-          video.volume = Math.min(1, video.volume + 0.1);
-          video.muted = false;
+          if (duckLevel != null) {
+            logicalVolume = Math.min(1, logicalVolume + 0.1);
+            volumeTarget.muted = false;
+            applyStreamMirrorVolume();
+          } else {
+            video.volume = Math.min(1, video.volume + 0.1);
+            video.muted = false;
+          }
+          refreshVolumeUi();
+          persistIntegratedAudioState();
           break;
         case 'ArrowDown':
           e.preventDefault();
-          video.volume = Math.max(0, video.volume - 0.1);
+          if (duckLevel != null) {
+            logicalVolume = Math.max(0, logicalVolume - 0.1);
+            applyStreamMirrorVolume();
+          } else {
+            video.volume = Math.max(0, video.volume - 0.1);
+          }
+          refreshVolumeUi();
+          persistIntegratedAudioState();
           break;
         case 'm':
         case 'M':
           e.preventDefault();
-          video.muted = !video.muted;
+          if (duckLevel != null) {
+            volumeTarget.muted = !volumeTarget.muted;
+            if (!volumeTarget.muted) {
+              applyStreamMirrorVolume();
+            }
+          } else {
+            video.muted = !video.muted;
+          }
+          refreshVolumeUi();
+          persistIntegratedAudioState();
           break;
       }
     }
 
     popup.addEventListener('keydown', onKeydown);
 
-    // Auto-hide controls
-    function showControls() {
+    // Controls only while hovering the player; hide immediately on mouseleave (no timer).
+    // Touch / coarse pointer: leave controls visible (no hover).
+    const playerRoot = elements.playerContainer || elements.videoWrapper;
+    function showControlsForHover() {
       elements.controls.classList.remove('hidden');
-      clearTimeout(hideControlsTimeout);
-      hideControlsTimeout = setTimeout(() => {
-        if (!video.paused) {
-          elements.controls.classList.add('hidden');
-        }
-      }, 3000);
+    }
+    function hideControlsForHover() {
+      elements.controls.classList.add('hidden');
+    }
+    let useHoverOnlyControls = false;
+    try {
+      useHoverOnlyControls = window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+    } catch (e) {
+      useHoverOnlyControls = false;
+    }
+    if (useHoverOnlyControls) {
+      elements.controls.classList.add('hidden');
+      playerRoot.addEventListener('mouseenter', showControlsForHover);
+      playerRoot.addEventListener('mouseleave', hideControlsForHover);
     }
 
-    elements.videoWrapper.addEventListener('mousemove', showControls);
-    elements.videoWrapper.addEventListener('mouseenter', showControls);
-    video.addEventListener('pause', showControls);
-    video.addEventListener('play', () => {
-      hideControlsTimeout = setTimeout(() => {
-        elements.controls.classList.add('hidden');
-      }, 3000);
-    });
-
-    // Initial show
-    showControls();
-
     refreshTimeUi();
+    refreshVolumeUi();
 
     // Do not call popup.focus() — let the window behave like a normal one (no forced raise)
 
-    // Handle popup close - restore video
-    popup.addEventListener('beforeunload', () => {
+    // Document PiP often skips beforeunload; pagehide + opener-side poll (installPopoutCloseWatcher) cover close.
+    function onPopoutWindowGoingAway() {
       restoreVideo(videoId);
-    });
+    }
+    popup.addEventListener('pagehide', onPopoutWindowGoingAway);
+    popup.addEventListener('beforeunload', onPopoutWindowGoingAway);
 
     // Clean up transitioning flag
     video._transitioning = false;
+
+    persistIntegratedAudioState();
   }
 
-  // Create placeholder in original position
-  function createPlaceholder(video, restoreInfo, videoId) {
+  // Stream mode: cover the whole player chrome (e.g. YouTube #movie_player), not just <video> — the <video> box
+  // can be shorter than the visible frame, which left a strip of playing video above the overlay.
+  function getPlaceholderCoverRect(video) {
+    const pad = 8;
+    let el = null;
+    if (isYoutubeHost()) {
+      el = video.closest('#movie_player');
+    }
+    if (!el) {
+      el = video.closest('.html5-video-container');
+    }
+    if (!el) {
+      el = video.closest('[class*="ytp-player"]');
+    }
+    if (!el) {
+      el = video;
+    }
+    let r = el.getBoundingClientRect();
+    if (r.width < 20 || r.height < 20) {
+      r = video.getBoundingClientRect();
+    }
+    return {
+      left: r.left - pad,
+      top: r.top - pad,
+      width: r.width + pad * 2,
+      height: r.height + pad * 2
+    };
+  }
+
+  function applyPlaceholderRect(placeholder, rect) {
+    placeholder.style.left = rect.left + 'px';
+    placeholder.style.top = rect.top + 'px';
+    placeholder.style.width = rect.width + 'px';
+    placeholder.style.height = rect.height + 'px';
+  }
+
+  function setupStreamPlaceholderPositionSync(placeholder, video) {
+    let raf = 0;
+    function scheduleSync() {
+      if (raf) {
+        return;
+      }
+      raf = requestAnimationFrame(function () {
+        raf = 0;
+        if (!placeholder.isConnected || !video.isConnected) {
+          return;
+        }
+        applyPlaceholderRect(placeholder, getPlaceholderCoverRect(video));
+      });
+    }
+    window.addEventListener('scroll', scheduleSync, true);
+    window.addEventListener('resize', scheduleSync);
+    const coverEl = video.closest('#movie_player') || video;
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined' && coverEl) {
+      ro = new ResizeObserver(scheduleSync);
+      try {
+        ro.observe(coverEl);
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    placeholder._ppCleanup = function () {
+      window.removeEventListener('scroll', scheduleSync, true);
+      window.removeEventListener('resize', scheduleSync);
+      if (ro) {
+        try {
+          ro.disconnect();
+        } catch (e2) {
+          /* ignore */
+        }
+      }
+    };
+    scheduleSync();
+  }
+
+  // Create placeholder in original position (stream mode: fixed overlay — source video stays in the DOM)
+  function createPlaceholder(video, restoreInfo, videoId, streamMode) {
     const placeholder = document.createElement('div');
     placeholder.className = 'popout-placeholder';
     placeholder.dataset.videoId = String(videoId);
 
-    // Match video dimensions
-    const rect = video.getBoundingClientRect();
-    placeholder.style.cssText = `
-      width: ${rect.width}px;
-      height: ${rect.height}px;
-      background: #000;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      color: white;
-      font-family: system-ui, -apple-system, sans-serif;
-      border-radius: inherit;
-      gap: 12px;
-    `;
+    const rect = streamMode ? getPlaceholderCoverRect(video) : video.getBoundingClientRect();
+    if (streamMode) {
+      placeholder.style.cssText = `
+        position: fixed;
+        left: ${rect.left}px;
+        top: ${rect.top}px;
+        width: ${rect.width}px;
+        height: ${rect.height}px;
+        background: #000;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-family: system-ui, -apple-system, sans-serif;
+        border-radius: 8px;
+        gap: 12px;
+        z-index: 2147483647;
+        box-sizing: border-box;
+        pointer-events: auto;
+        isolation: isolate;
+      `;
+      setupStreamPlaceholderPositionSync(placeholder, video);
+    } else {
+      placeholder.style.cssText = `
+        width: ${rect.width}px;
+        height: ${rect.height}px;
+        background: #000;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-family: system-ui, -apple-system, sans-serif;
+        border-radius: inherit;
+        gap: 12px;
+      `;
+    }
 
     const message = document.createElement('div');
     message.textContent = 'Playing in popout window';
@@ -1100,11 +1839,32 @@
     });
     placeholder.appendChild(returnBtn);
 
-    // Insert at original position
-    if (restoreInfo.nextSibling) {
+    if (streamMode) {
+      document.body.appendChild(placeholder);
+    } else if (restoreInfo.nextSibling) {
       restoreInfo.parent.insertBefore(placeholder, restoreInfo.nextSibling);
     } else {
       restoreInfo.parent.appendChild(placeholder);
+    }
+  }
+
+  function cleanupStreamMirror(popoutInfo) {
+    if (popoutInfo.displayVideo) {
+      try {
+        popoutInfo.displayVideo.pause();
+        popoutInfo.displayVideo.srcObject = null;
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    if (popoutInfo.stream) {
+      try {
+        popoutInfo.stream.getTracks().forEach(function (t) {
+          t.stop();
+        });
+      } catch (e2) {
+        /* ignore */
+      }
     }
   }
 
@@ -1113,19 +1873,77 @@
     const popoutInfo = activePopouts.get(videoId);
     if (!popoutInfo) return;
 
-    const { video, restoreInfo } = popoutInfo;
+    clearPopoutCloseWatcher(popoutInfo);
 
-    // Find placeholder
+    if (typeof popoutInfo.releasePlaybackHold === 'function') {
+      popoutInfo.releasePlaybackHold();
+    }
+
+    const { video, restoreInfo } = popoutInfo;
+    const mode = popoutInfo.mode || 'moved';
+
+    let shouldResume = !video.paused;
+    if (popoutInfo.keepPlayingIntent === false) {
+      shouldResume = false;
+    } else if (popoutInfo.keepPlayingIntent === true) {
+      shouldResume = true;
+    }
+
     const placeholder = document.querySelector(`[data-video-id="${videoId}"]`);
 
-    // Check if restore location still exists
+    if (mode === 'stream') {
+      cleanupStreamMirror(popoutInfo);
+      if (placeholder && placeholder.isConnected) {
+        if (typeof placeholder._ppCleanup === 'function') {
+          placeholder._ppCleanup();
+        }
+        placeholder.remove();
+      }
+      try {
+        const iv = popoutInfo.integratedVolume;
+        const im = popoutInfo.integratedMuted;
+        if (typeof iv === 'number' && isFinite(iv)) {
+          video.volume = Math.min(1, Math.max(0, iv));
+        } else {
+          video.volume = popoutInfo.savedVolume;
+        }
+        video.muted = typeof im === 'boolean' ? im : popoutInfo.savedMuted;
+      } catch (e) {
+        /* ignore */
+      }
+      if (restoreInfo.style) {
+        video.setAttribute('style', restoreInfo.style);
+      } else {
+        video.removeAttribute('style');
+      }
+      video._transitioning = false;
+      activePopouts.delete(videoId);
+      resumePlaybackAfterPopout(video, shouldResume);
+      return;
+    }
+
     if (!restoreInfo.parent.isConnected) {
       console.warn('PopoutPlayer: Original parent no longer exists');
       activePopouts.delete(videoId);
       return;
     }
 
-    // Move video back
+    // Levels from popout session (persisted on every control change) — re-apply after DOM move.
+    let liveVolume = 1;
+    let liveMuted = false;
+    try {
+      liveVolume = video.volume;
+      liveMuted = video.muted;
+    } catch (e) {
+      /* ignore */
+    }
+    const outVol =
+      typeof popoutInfo.integratedVolume === 'number' && isFinite(popoutInfo.integratedVolume)
+        ? Math.min(1, Math.max(0, popoutInfo.integratedVolume))
+        : liveVolume;
+    const outMuted =
+      typeof popoutInfo.integratedMuted === 'boolean' ? popoutInfo.integratedMuted : liveMuted;
+
     if (placeholder && placeholder.isConnected) {
       restoreInfo.parent.insertBefore(video, placeholder);
       placeholder.remove();
@@ -1135,16 +1953,22 @@
       restoreInfo.parent.appendChild(video);
     }
 
-    // Restore original styles
     if (restoreInfo.style) {
       video.setAttribute('style', restoreInfo.style);
     } else {
       video.removeAttribute('style');
     }
 
-    // Clean up
+    try {
+      video.volume = outVol;
+      video.muted = outMuted;
+    } catch (e) {
+      /* ignore */
+    }
+
     video._transitioning = false;
     activePopouts.delete(videoId);
+    resumePlaybackAfterPopout(video, shouldResume);
   }
 
   function showPopoutHint(text) {
@@ -1265,14 +2089,10 @@
     setTimeout(() => banner.remove(), 10000);
   }
 
-  // Handle navigate back messages
+  // Legacy: same-tab postMessage path (Navigate Back now calls focusSourceTabAndScrollToVideo directly).
   window.addEventListener('message', (event) => {
-    if (event.data && event.data.type === 'popout-navigate-back') {
-      const videoId = event.data.videoId;
-      const placeholder = document.querySelector(`[data-video-id="${videoId}"]`);
-      if (placeholder) {
-        placeholder.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      }
+    if (event.data && event.data.type === 'popout-navigate-back' && event.data.videoId != null) {
+      focusSourceTabAndScrollToVideo(event.data.videoId);
     }
   });
 

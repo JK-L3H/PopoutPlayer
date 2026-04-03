@@ -35,7 +35,7 @@ A Chrome extension that replicates Firefox's Picture-in-Picture feature with unl
 ### Method 2: Extension Icon
 1. Navigate to any webpage with videos
 2. Click the PopoutPlayer extension icon in your Chrome toolbar
-3. The largest visible video will pop out automatically (on **youtube.com**, use **Method 1** for Picture-in-Picture — Chrome only allows PiP after a direct click on the page, not from the toolbar alone)
+3. The largest visible video will pop out automatically into the custom window (same behavior on all sites, including **youtube.com**)
 
 ### Controls
 
@@ -56,16 +56,17 @@ A Chrome extension that replicates Firefox's Picture-in-Picture feature with unl
 
 ## How It Works
 
-PopoutPlayer uses `window.open()` to create same-origin popup windows and physically moves the `<video>` DOM element into them. Each popout gets a **globally unique** window name so Chrome does not reuse one window and replace another (names like `popout-player-0` are shared across tabs). This allows unlimited simultaneous popouts.
+PopoutPlayer uses `window.open()` to create same-origin popup windows. For **adaptive streaming** (MSE/DASH/HLS — Rumble, many news sites, etc.), moving the real `<video>` node into another document breaks the media pipeline (`0:00 / --:--`). When possible, the extension uses **`HTMLMediaElement.captureStream()`** to keep decoding in the original page and mirror picture and sound into the popout. If capture is unavailable, it falls back to moving the element (works for simple progressive `src=` videos). Each popout gets a **globally unique** window name so Chrome does not reuse one window and replace another.
 
 **Key Technical Details:**
-- ✅ **Unlimited simultaneous popouts** on most sites — each one is a separate `window.open()`. **youtube.com** is special: moving the `<video>` into another window breaks YouTube’s player (black screen), so the extension uses **Chrome’s Picture-in-Picture** there by default (**one** PiP at a time). On YouTube, **Shift+click** the overlay to force the custom window (usually still broken).
+- ✅ **Unlimited simultaneous popouts** — each one is a separate `window.open()` with the custom player. **youtube.com** can still break for some DRM/MSE cases; **Shift+click** the overlay (or toolbar) for **Chrome’s Picture-in-Picture** instead (**one** at a time).
 - ✅ Works with complex video players (YouTube, Twitch, Netflix UI)
 - ✅ Preserves video state and playback (custom window path)
-- ✅ No per-tab limit on **custom** PopoutPlayer windows; YouTube uses PiP (browser limit)
+- ✅ No per-tab limit on **custom** PopoutPlayer windows; native PiP only if you use **Shift+click** (browser limit: one PiP)
 - ✅ Detects videos in shadow DOM
 - ✅ Handles dynamically loaded videos
 - ⚠️ Popout windows are not OS “always on top” (Chrome’s separate native PiP is one-at-a-time and uses Chrome’s own UI; Shift+click on the overlay uses that path)
+- ⚠️ Popouts use `window.open(..., 'popup=yes')` so Chromium opens a **minimal** window (no tab strip; often no address bar). The **OS title bar** (minimize / maximize / close) stays. Chrome may still show a compact URL or security affordance in some versions; that is enforced by the browser and cannot be fully removed from ordinary web pages.
 - ⚠️ Popup blockers must be disabled for this site
 - ⚠️ Doesn't work with cross-origin iframe embeds (e.g., YouTube embeds on other sites - but works fine on youtube.com directly)
 
