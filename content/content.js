@@ -75,7 +75,7 @@
   function isExtensionContextInvalidated(err) {
     return (
       err &&
-      (err.message === 'Extension context invalidated.' || err.message === 'Extension context invalidated')
+      err.message === 'Extension context invalidated.'
     );
   }
 
@@ -573,7 +573,7 @@
     );
 
     let node;
-    while (node = walker.nextNode()) {
+    while ((node = walker.nextNode())) {
       if (node.shadowRoot) {
         videos.push(...findAllVideos(node.shadowRoot));
       }
@@ -649,9 +649,7 @@
     const button = document.createElement('button');
     button.className = 'popout-overlay-button hidden';
     button.innerHTML = ICONS.pip;
-    button.title = isYoutubeHost()
-      ? 'Pop out (custom window). Shift+click: Chrome Picture-in-Picture instead (one at a time).'
-      : 'Pop out (unlimited custom windows). Shift+click: Chrome Picture-in-Picture instead.';
+    button.title = 'Pop out (unlimited custom windows). Shift+click: Chrome Picture-in-Picture instead.';
     shadow.appendChild(button);
 
     // Position tracker
@@ -2222,14 +2220,15 @@
       cursor: pointer;
       font-size: 13px;
     `;
-    fallbackBtn.addEventListener('click', async () => {
-      try {
-        if (document.pictureInPictureEnabled && !video.disablePictureInPicture) {
-          await video.requestPictureInPicture();
-          banner.remove();
-        }
-      } catch (error) {
-        console.error('PiP fallback failed:', error);
+    fallbackBtn.addEventListener('click', () => {
+      if (document.pictureInPictureEnabled && !video.disablePictureInPicture) {
+        video.requestPictureInPicture()
+          .then(() => {
+            banner.remove();
+          })
+          .catch((error) => {
+            console.error('PiP fallback failed:', error);
+          });
       }
     });
     banner.appendChild(fallbackBtn);
@@ -2284,20 +2283,41 @@
 
     const best = pickBestVideo(eligibleVideos);
     if (best) {
+      // Toolbar path: background.js opens a minimal popup synchronously during the toolbar click (preserving user
+      // activation) via executeScript in MAIN world. If toolbarPopupName is provided, that window should exist;
+      // retrieve it by name (works cross-world). If toolbarPopupName is null, the MAIN world open was blocked.
       let preOpened = null;
       if (message.toolbarPopupName) {
         try {
-          preOpened = window[message.toolbarPopupName];
-          if (!preOpened || preOpened.closed) {
-            preOpened = window.frames[message.toolbarPopupName];
+          // window.open('', name, '') returns the existing named window (opened in MAIN world with popup features).
+          const candidate = window.open('', message.toolbarPopupName, '');
+          if (candidate && !candidate.closed) {
+            try {
+              // Verify it's our about:blank popup (not a different window with the same name or a new window
+              // created because MAIN world open failed).
+              if (candidate.location.href === 'about:blank') {
+                preOpened = candidate;
+              } else {
+                candidate.close();
+              }
+            } catch (crossOriginErr) {
+              // Cross-origin → not our about:blank → close and fall back
+              try {
+                candidate.close();
+              } catch (e) {}
+            }
           }
         } catch (e) {
           preOpened = null;
         }
-        if (preOpened && preOpened.closed) {
-          preOpened = null;
-        }
+      } else {
+        // toolbarPopupName is null → MAIN world window.open was blocked. Don't try to open here (no user
+        // activation in async message handler → would get full chrome). Show blocked banner instead.
+        best._transitioning = false;
+        showPopupBlockedBanner(best);
+        return;
       }
+
       popoutVideo(best, null, preOpened);
     }
   });

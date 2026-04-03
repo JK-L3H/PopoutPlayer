@@ -63,10 +63,9 @@
       // world), then the content script grabs it via window[name] and attaches the player.
       var w = 800;
       var h = 450;
-      var sw = typeof screen !== 'undefined' && screen.availWidth ? screen.availWidth : 1920;
-      var sh = typeof screen !== 'undefined' && screen.availHeight ? screen.availHeight : 1080;
-      var left = Math.max(0, Math.round((sw - w) / 2));
-      var top = Math.max(0, Math.round((sh - h) / 2));
+      // Service workers don't have access to screen; content script will center the window
+      var left = 100;
+      var top = 100;
       var winName = 'pp_tb_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
       var featStr = [
         'popup=yes',
@@ -94,19 +93,26 @@
           world: 'MAIN',
           injectImmediately: true,
           func: function (name, feats) {
-            window.open('about:blank', name, feats);
+            // Return whether window.open succeeded (null = blocked by popup blocker)
+            var popup = window.open('about:blank', name, feats);
+            return popup != null && !popup.closed;
           },
           args: [winName, featStr]
         },
-        function () {
+        function (results) {
           if (chrome.runtime.lastError) {
             chrome.tabs.sendMessage(tab.id, { type: 'popout-largest-video' }).catch(function (err) {
               console.error('Failed to send message to content script:', err);
             });
             return;
           }
+          // Check if the window.open succeeded (results[0].result will be true/false)
+          var openSucceeded = results && results[0] && results[0].result === true;
           chrome.tabs
-            .sendMessage(tab.id, { type: 'popout-largest-video', toolbarPopupName: winName })
+            .sendMessage(tab.id, {
+              type: 'popout-largest-video',
+              toolbarPopupName: openSucceeded ? winName : null
+            })
             .catch(function (err) {
               console.error('Failed to send message to content script:', err);
             });
