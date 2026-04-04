@@ -932,34 +932,9 @@
         return;
       }
 
-      const docPipApi = resolveDocumentPictureInPictureApi();
-      const canUseDocPip = docPipApi && typeof docPipApi.requestWindow === 'function';
-
-      if (canUseDocPip) {
-        const reservedFallback = openFallbackAuxiliaryWindow(size, uniqueWinName);
-        docPipApi
-          .requestWindow({
-            width: size.width,
-            height: size.height,
-            disallowReturnToOpener: true
-          })
-          .then(function (pipWindow) {
-            if (reservedFallback && !reservedFallback.closed) {
-              try {
-                reservedFallback.close();
-              } catch (e) {
-                /* ignore */
-              }
-            }
-            startFetchAndBuild(pipWindow);
-          })
-          .catch(function (err) {
-            console.warn('PopoutPlayer: Document PiP window unavailable, using reserved popup', err);
-            startFetchAndBuild(reservedFallback);
-          });
-      } else {
-        startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
-      }
+      // Always use classic popup windows (popup=yes) for sleek, minimal look.
+      // Document PiP has OS title bars which aren't as minimal.
+      startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
     } catch (error) {
       if (isExtensionContextInvalidated(error)) {
         video._transitioning = false;
