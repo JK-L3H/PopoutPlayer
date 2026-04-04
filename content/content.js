@@ -932,9 +932,22 @@
         return;
       }
 
-      // Always use classic popup windows (popup=yes) for sleek, minimal look.
-      // Document PiP has OS title bars which aren't as minimal.
-      startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
+      // Try Document Picture-in-Picture first for a truly minimal window (no title bar).
+      // Falls back to classic popup if Document PiP is not available.
+      const api = resolveDocumentPictureInPictureApi();
+      if (api) {
+        api
+          .requestWindow({ width: size.width, height: size.height })
+          .then(function (pipWin) {
+            startFetchAndBuild(pipWin);
+          })
+          .catch(function (err) {
+            console.warn('PopoutPlayer: Document PiP failed, using fallback window', err);
+            startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
+          });
+      } else {
+        startFetchAndBuild(openFallbackAuxiliaryWindow(size, uniqueWinName));
+      }
     } catch (error) {
       if (isExtensionContextInvalidated(error)) {
         video._transitioning = false;
