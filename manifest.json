@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PopoutPlayer",
-  "version": "1.5.29",
+  "version": "1.5.30",
   "description": "Pop videos into separate windows — unlimited at once — with full player controls",
   "permissions": ["activeTab", "tabs", "windows", "scripting"],
   "action": {
