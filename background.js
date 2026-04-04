@@ -20,7 +20,7 @@
       }
       return onAct;
     } catch (e) {
-      /* ignore */
+      console.warn('PopoutPlayer: chrome.action access failed', e);
     }
 
     try {
@@ -34,7 +34,7 @@
       }
       return onBrowser;
     } catch (e) {
-      /* ignore */
+      console.warn('PopoutPlayer: chrome.browserAction access failed', e);
     }
 
     return null;
@@ -101,8 +101,9 @@
         },
         function (results) {
           if (chrome.runtime.lastError) {
+            console.warn('PopoutPlayer: executeScript failed', chrome.runtime.lastError.message);
             chrome.tabs.sendMessage(tab.id, { type: 'popout-largest-video' }).catch(function (err) {
-              console.error('Failed to send message to content script:', err);
+              console.error('PopoutPlayer: fallback sendMessage failed', err);
             });
             return;
           }
@@ -137,16 +138,22 @@
       }
       chrome.tabs.get(tabId, function (tab) {
         if (chrome.runtime.lastError || !tab) {
-          sendResponse({ ok: false, error: chrome.runtime.lastError && chrome.runtime.lastError.message });
+          var errMsg = chrome.runtime.lastError && chrome.runtime.lastError.message;
+          console.warn('PopoutPlayer: tabs.get failed', errMsg);
+          sendResponse({ ok: false, error: errMsg });
           return;
         }
         var windowId = message.windowId != null ? message.windowId : tab.windowId;
         chrome.tabs.update(tabId, { active: true }, function () {
           if (chrome.runtime.lastError) {
+            console.warn('PopoutPlayer: tabs.update failed', chrome.runtime.lastError.message);
             sendResponse({ ok: false, error: chrome.runtime.lastError.message });
             return;
           }
           chrome.windows.update(windowId, { focused: true }, function () {
+            if (chrome.runtime.lastError) {
+              console.warn('PopoutPlayer: windows.update failed', chrome.runtime.lastError.message);
+            }
             sendResponse({ ok: !chrome.runtime.lastError });
           });
         });
