@@ -9,6 +9,12 @@
             "command": "git push 2>/dev/null || true",
             "if": "Bash(git commit*)",
             "statusMessage": "Pushing to remote..."
+          },
+          {
+            "type": "command",
+            "command": "git fetch origin 2>/dev/null && LOCAL=$(git rev-parse @ 2>/dev/null) && REMOTE=$(git rev-parse @{u} 2>/dev/null) && [ \"$LOCAL\" != \"$REMOTE\" ] && git pull 2>/dev/null || true",
+            "if": "Bash(git push*)",
+            "statusMessage": "Syncing with remote..."
           }
         ]
       }
