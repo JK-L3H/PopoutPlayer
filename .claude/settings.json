@@ -17,6 +17,16 @@
             "statusMessage": "Syncing with remote..."
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/validate-extension.mjs\"",
+            "statusMessage": "Validating PopoutPlayer extension..."
+          }
+        ]
       }
     ]
   }

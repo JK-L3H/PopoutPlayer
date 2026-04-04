@@ -46,10 +46,16 @@
   const POPOUT_PLAYER_CSS_FALLBACK =
     '*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%;height:100%;overflow:hidden;background:#000;font-family:system-ui,sans-serif}' +
     '.player-container{display:flex;flex-direction:column;width:100%;height:100%;min-height:0;position:relative;background:#000;justify-content:flex-start;align-items:stretch}' +
+    '.popout-titlebar{flex-shrink:0;display:flex;align-items:center;gap:8px;min-height:32px;padding:0 8px 0 12px;background:rgba(10,10,12,.78);border-bottom:1px solid rgba(255,255,255,.07);z-index:40;user-select:none}' +
+    '.popout-titlebar-icon{flex-shrink:0;display:flex;width:18px;height:18px;opacity:.88;color:rgba(255,255,255,.92)}' +
+    '.popout-titlebar-icon svg{width:18px;height:18px;fill:currentColor}' +
+    '.popout-titlebar-title{flex:1;min-width:0;font-size:12px;font-weight:500;letter-spacing:.02em;color:rgba(255,255,255,.88);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.popout-titlebar-close{flex-shrink:0;width:30px;height:28px;border:none;border-radius:6px;background:transparent;color:rgba(255,255,255,.85);cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;opacity:.78}' +
+    '.popout-titlebar:hover .popout-titlebar-close,.popout-titlebar-close:hover{opacity:1}' +
+    '.popout-titlebar-close:hover{background:rgba(244,67,54,.38);color:#fff}' +
+    '.popout-titlebar-close svg{width:18px;height:18px;fill:currentColor}' +
     '.video-wrapper{flex:1 1 auto;min-height:0;width:100%;position:relative;display:flex;align-items:center;justify-content:center;background:#000;overflow:hidden}' +
     '.video-wrapper video{display:block;width:100%;height:100%;object-fit:contain;object-position:center center}' +
-    '.popout-close-float{position:absolute;top:10px;right:10px;z-index:25;width:40px;height:40px;border:none;border-radius:8px;background:rgba(0,0,0,.55);cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;opacity:0;pointer-events:none}' +
-    '.player-container:hover .popout-close-float{opacity:1;pointer-events:auto}' +
     '.controls{position:absolute;bottom:0;left:0;right:0;padding:20px 16px 12px;z-index:10;background:linear-gradient(to top,rgba(0,0,0,.9),transparent);transition:opacity .15s ease-out}' +
     '.controls.hidden{opacity:0;transform:translateY(100%);pointer-events:none;transition:none}' +
     '.bottom-controls{display:flex;justify-content:space-between;align-items:center;gap:16px}' +
@@ -62,6 +68,27 @@
     '.scrubber{width:100%}.volume-slider{width:80px}';
 
   // Utility: Format time as MM:SS or HH:MM:SS
+  function sanitizePageTitleForPopout(raw) {
+    if (!raw || typeof raw !== 'string') {
+      return '';
+    }
+    var t = raw.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim();
+    if (t.length > 220) {
+      t = t.slice(0, 217) + '...';
+    }
+    return t;
+  }
+
+  function truncateTitleForChromeTab(raw, maxLen) {
+    if (!raw) {
+      return '';
+    }
+    if (raw.length <= maxLen) {
+      return raw;
+    }
+    return raw.slice(0, Math.max(0, maxLen - 1)) + '\u2026';
+  }
+
   function formatTime(seconds) {
     if (!isFinite(seconds)) return '0:00';
     const hours = Math.floor(seconds / 3600);
@@ -800,6 +827,7 @@
         style: video.getAttribute('style') || '',
         scrollY: window.scrollY,
         scrollX: window.scrollX,
+        pageTitle: sanitizePageTitleForPopout(typeof document !== 'undefined' ? document.title : ''),
         // Captured before any async ducking so stream-mode restore and mirror volume math stay correct.
         prePopoutAudioSnapshot: { volume: video.volume, muted: video.muted }
       };
@@ -1229,8 +1257,10 @@
     const doc = popup.document;
     ensurePopupDocStructure(doc);
 
-    // Set up document
-    doc.title = 'PopoutPlayer';
+    // Window title: prefer source page title (truncated) so the OS chrome stays readable.
+    const pageTitle = restoreInfo && restoreInfo.pageTitle ? sanitizePageTitleForPopout(restoreInfo.pageTitle) : '';
+    const titleForBar = pageTitle || 'PopoutPlayer';
+    doc.title = pageTitle ? truncateTitleForChromeTab(pageTitle + ' \u00B7 PopoutPlayer', 110) : 'PopoutPlayer';
 
     const style = doc.createElement('style');
     style.setAttribute('type', 'text/css');
@@ -1244,6 +1274,30 @@
     // Create container
     const container = doc.createElement('div');
     container.className = 'player-container';
+
+    const titleBar = doc.createElement('div');
+    titleBar.className = 'popout-titlebar';
+
+    const titleIcon = doc.createElement('span');
+    titleIcon.className = 'popout-titlebar-icon';
+    titleIcon.setAttribute('aria-hidden', 'true');
+    titleIcon.innerHTML = ICONS.pip;
+
+    const titleText = doc.createElement('span');
+    titleText.className = 'popout-titlebar-title';
+    titleText.textContent = truncateTitleForChromeTab(titleForBar, 72);
+
+    const titleBarCloseBtn = doc.createElement('button');
+    titleBarCloseBtn.type = 'button';
+    titleBarCloseBtn.className = 'popout-titlebar-close';
+    titleBarCloseBtn.setAttribute('aria-label', 'Close and restore video');
+    titleBarCloseBtn.innerHTML = ICONS.close;
+    titleBarCloseBtn.title = 'Close and restore video';
+
+    titleBar.appendChild(titleIcon);
+    titleBar.appendChild(titleText);
+    titleBar.appendChild(titleBarCloseBtn);
+    container.appendChild(titleBar);
 
     // Video wrapper
     const videoWrapper = doc.createElement('div');
@@ -1327,15 +1381,6 @@
       videoWrapper.style.position = 'relative';
       videoWrapper.style.zIndex = '0';
     }
-
-    // Close lives here (top-right, hover) — not in the bottom bar.
-    const closeFloatBtn = doc.createElement('button');
-    closeFloatBtn.type = 'button';
-    closeFloatBtn.className = 'popout-close-float';
-    closeFloatBtn.setAttribute('aria-label', 'Close and restore video');
-    closeFloatBtn.innerHTML = ICONS.close;
-    closeFloatBtn.title = 'Close and restore video';
-    videoWrapper.appendChild(closeFloatBtn);
 
     // Controls container
     const controls = doc.createElement('div');
@@ -1442,7 +1487,7 @@
       volumeBtn,
       volumeSlider,
       navigateBackBtn,
-      closeBtn: closeFloatBtn,
+      closeBtn: titleBarCloseBtn,
       controls,
       videoWrapper,
       playerContainer: container

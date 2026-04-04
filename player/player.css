@@ -26,6 +26,92 @@ html, body {
   align-items: stretch;
 }
 
+/* Top strip: page title + close — reads like minimal window chrome next to the OS title bar */
+.popout-titlebar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 8px 0 12px;
+  background: rgba(10, 10, 12, 0.78);
+  backdrop-filter: blur(16px) saturate(1.15);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.4);
+  z-index: 40;
+  user-select: none;
+}
+
+.popout-titlebar-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  opacity: 0.88;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.popout-titlebar-icon svg {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+}
+
+.popout-titlebar-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: rgba(255, 255, 255, 0.88);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.popout-titlebar-close {
+  flex-shrink: 0;
+  width: 30px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  opacity: 0.78;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.popout-titlebar:hover .popout-titlebar-close,
+.popout-titlebar-close:hover {
+  opacity: 1;
+}
+
+.popout-titlebar-close:hover {
+  background: rgba(244, 67, 54, 0.38);
+  color: #fff;
+}
+
+.popout-titlebar-close svg {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+  pointer-events: none;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .popout-titlebar-close {
+    opacity: 0.92;
+  }
+}
+
 .video-wrapper {
   flex: 1 1 auto;
   min-width: 0;
@@ -45,58 +131,6 @@ html, body {
   height: 100%;
   object-fit: contain;
   object-position: center center;
-}
-
-/* Top-right close — only while hovering the player (Chrome may still show its own PiP strip above this). */
-.popout-close-float {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 25;
-  width: 40px;
-  height: 40px;
-  border: none;
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.55);
-  color: #fff;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.15s ease-out, background 0.15s ease;
-}
-
-.player-container:hover .popout-close-float {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.popout-close-float:hover {
-  background: rgba(244, 67, 54, 0.88);
-}
-
-.popout-close-float:focus-visible {
-  opacity: 1;
-  pointer-events: auto;
-  outline: 2px solid #2196F3;
-  outline-offset: 2px;
-}
-
-.popout-close-float svg {
-  width: 20px;
-  height: 20px;
-  fill: white;
-  pointer-events: none;
-}
-
-@media (hover: none), (pointer: coarse) {
-  .popout-close-float {
-    opacity: 0.75;
-    pointer-events: auto;
-  }
 }
 
 /* Controls — hover-only on fine pointers (see content script); hide is instant (no transition) */
@@ -333,9 +367,14 @@ html, body {
 
 /* Focus styles for accessibility */
 .control-btn:focus-visible,
-.popout-close-float:focus-visible,
 .scrubber:focus-visible,
 .volume-slider:focus-visible {
+  outline: 2px solid #2196F3;
+  outline-offset: 2px;
+}
+
+.popout-titlebar-close:focus-visible {
+  opacity: 1;
   outline: 2px solid #2196F3;
   outline-offset: 2px;
 }
