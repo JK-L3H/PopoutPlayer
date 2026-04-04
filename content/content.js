@@ -9,7 +9,32 @@
   const videoOverlays = new WeakMap();
   const videoCleanupFunctions = new WeakMap(); // Store cleanup functions for each video
   const activePopouts = new Map(); // videoId -> { popup, restoreInfo }
+  const volumeBackups = new WeakMap(); // video -> originalVolume for reliable restoration
+  const cleanedVideos = new WeakSet(); // Track cleaned videos to prevent double-cleanup
   let nextVideoId = 0;
+
+  // Constants - extracted magic numbers for maintainability
+  const CONSTANTS = {
+    STREAM_SOURCE_TAB_VOLUME_CAP: 0.001,
+    POPUP_READY_MAX_ATTEMPTS: 80,
+    POPUP_READY_TICK_MS: 50,
+    HIDE_CONTROLS_DELAY_MS: 300,
+    PLAYBACK_HOLD_POLL_MS: 100,
+    PLAYBACK_HOLD_MAX_TICKS: 300,
+    POPOUT_COOLDOWN_MS: 500,
+    RESUME_RETRY_DELAYS: [0, 30, 100, 250],
+    VISIBILITY_RETRY_DELAYS: [0, 80],
+    Z_INDEX_BASE: 2147483640,
+    Z_INDEX_CONTROLS: 2147483645,
+    Z_INDEX_OVERLAY: 2147483647,
+    MIN_VIDEO_WIDTH: 150,
+    MIN_VIDEO_HEIGHT: 100,
+    MIN_POPOUT_WIDTH: 400,
+    MIN_POPOUT_HEIGHT: 220
+  };
+
+  // Last popout attempt timestamp for rate limiting
+  let lastPopoutAttemptTime = 0;
 
   // SVG Icons
   const ICONS = {
@@ -100,6 +125,63 @@
     return `${minutes}:${secs.toString().padStart(2, '0')}`;
   }
 
+  // Utility: Create SVG element from string safely (XSS prevention)
+  function createSVGElement(svgString) {
+    const template = document.createElement('template');
+    template.innerHTML = svgString.trim();
+    return template.content.firstChild;
+  }
+
+  // Utility: Safe video.play() with logging instead of silent catch
+  function safePlay(video, context) {
+    const p = video.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch(function (err) {
+        console.warn('PopoutPlayer: video.play() failed', context || '', err);
+      });
+    }
+    return p;
+  }
+
+  // Utility: Backup video volume before ducking
+  function backupVolume(video) {
+    if (!volumeBackups.has(video)) {
+      try {
+        volumeBackups.set(video, video.volume);
+      } catch (e) {
+        console.warn('PopoutPlayer: volume backup failed', e);
+      }
+    }
+  }
+
+  // Utility: Restore video volume from backup
+  function restoreVolume(video) {
+    if (volumeBackups.has(video)) {
+      try {
+        video.volume = volumeBackups.get(video);
+        volumeBackups.delete(video);
+      } catch (e) {
+        console.warn('PopoutPlayer: volume restore failed', e);
+      }
+    }
+  }
+
+  // Utility: Check if element is editable (for keyboard event filtering)
+  function isEditableElement(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+  }
+
+  // Utility: Get fullscreen element with vendor prefixes
+  function getFullscreenElement(doc) {
+    return doc.fullscreenElement ||
+           doc.webkitFullscreenElement ||
+           doc.mozFullScreenElement ||
+           doc.msFullscreenElement ||
+           null;
+  }
+
   function isExtensionContextInvalidated(err) {
     return (
       err &&
@@ -138,14 +220,13 @@
   // Initial window size from in-page video box × intrinsic aspect ratio. No clamp to screen or “100%” —
   // the user can resize freely afterward; the player fills the window via CSS.
   function computePopoutWindowSizeFromDims(vw, vh, rect) {
-    const minW = 400;
     const ar = vw / vh;
     const hintW = rect && rect.width > 0 ? rect.width : 640;
-    const w = Math.max(minW, hintW);
+    const w = Math.max(CONSTANTS.MIN_POPOUT_WIDTH, hintW);
     const h = w / ar;
     return {
       width: Math.round(w),
-      height: Math.round(Math.max(220, h))
+      height: Math.round(Math.max(CONSTANTS.MIN_POPOUT_HEIGHT, h))
     };
   }
 
@@ -160,11 +241,11 @@
       return size;
     }
     const margin = 64;
-    const maxW = Math.max(400, screen.availWidth - margin);
-    const maxH = Math.max(220, screen.availHeight - margin);
+    const maxW = Math.max(CONSTANTS.MIN_POPOUT_WIDTH, screen.availWidth - margin);
+    const maxH = Math.max(CONSTANTS.MIN_POPOUT_HEIGHT, screen.availHeight - margin);
     return {
-      width: Math.min(Math.max(400, size.width), maxW),
-      height: Math.min(Math.max(220, size.height), maxH)
+      width: Math.min(Math.max(CONSTANTS.MIN_POPOUT_WIDTH, size.width), maxW),
+      height: Math.min(Math.max(CONSTANTS.MIN_POPOUT_HEIGHT, size.height), maxH)
     };
   }
 
@@ -198,7 +279,7 @@
     const style = window.getComputedStyle(video);
 
     // Filter out tiny videos and hidden videos
-    if (rect.width < 150 || rect.height < 100) return false;
+    if (rect.width < CONSTANTS.MIN_VIDEO_WIDTH || rect.height < CONSTANTS.MIN_VIDEO_HEIGHT) return false;
     if (style.display === 'none' || style.visibility === 'hidden') return false;
     // YouTube and others use position:fixed for the main player — offsetParent is often null then
     const pos = style.position;
@@ -385,10 +466,9 @@
 
   // Tab output must be nearly silent while the popout plays the mirror, or users hear echo. Do not use volume 0
   // (often black video from captureStream) or element mute (can drop audio from the captured stream).
-  const STREAM_SOURCE_TAB_VOLUME_CAP = 0.001;
-
   function applyStreamSourceTabDuck(video) {
-    const cap = STREAM_SOURCE_TAB_VOLUME_CAP;
+    const cap = CONSTANTS.STREAM_SOURCE_TAB_VOLUME_CAP;
+    backupVolume(video); // Backup before ducking for reliable restoration
     try {
       const v = video.volume;
       if (v <= 0.001) {
@@ -397,7 +477,7 @@
         video.volume = Math.min(v, cap);
       }
     } catch (e) {
-      /* ignore */
+      console.warn('PopoutPlayer: volume ducking failed', e);
     }
   }
 
@@ -623,7 +703,7 @@
   function createOverlay(video) {
     // Create shadow host
     const host = document.createElement('div');
-    host.style.cssText = 'position: fixed; z-index: 2147483647; pointer-events: none;';
+    host.style.cssText = `position: fixed; z-index: ${CONSTANTS.Z_INDEX_OVERLAY}; pointer-events: none;`;
 
     // Attach closed shadow DOM for style isolation
     const shadow = host.attachShadow({ mode: 'closed' });
@@ -634,7 +714,7 @@
       :host {
         all: initial;
         position: fixed;
-        z-index: 2147483647;
+        z-index: ${CONSTANTS.Z_INDEX_OVERLAY};
         pointer-events: none;
       }
       .popout-overlay-button {
@@ -676,8 +756,9 @@
     // Create button
     const button = document.createElement('button');
     button.className = 'popout-overlay-button hidden';
-    button.innerHTML = ICONS.pip;
+    button.appendChild(createSVGElement(ICONS.pip));
     button.title = 'Pop out (unlimited custom windows). Shift+click: Chrome Picture-in-Picture instead.';
+    button.setAttribute('aria-label', 'Pop out video');
     shadow.appendChild(button);
 
     // Position tracker
@@ -814,11 +895,17 @@
       const uniqueWinName =
         'pp_' + videoId + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 12);
 
-      // Record restore information
+      // Record restore information with validation
       const parent = video.parentElement;
       if (!parent) {
         video._transitioning = false;
         showPopoutHint('Cannot pop out video: video element has no parent element.');
+        return;
+      }
+      // Validate parent is connected to document tree
+      if (!parent.isConnected) {
+        video._transitioning = false;
+        showPopoutHint('Cannot pop out video: parent element is not connected to the document.');
         return;
       }
       const restoreInfo = {
@@ -1049,13 +1136,10 @@
     function tryPlay() {
       try {
         if (video.paused) {
-          const p = video.play();
-          if (p && typeof p.catch === 'function') {
-            p.catch(function () {});
-          }
+          safePlay(video, 'resumePlaybackAfterPopout');
         }
       } catch (e) {
-        /* ignore */
+        console.warn('PopoutPlayer: tryPlay failed', e);
       }
     }
     tryPlay();
@@ -1086,13 +1170,10 @@
       }
       try {
         if (video.paused) {
-          const p = video.play();
-          if (p && typeof p.catch === 'function') {
-            p.catch(function () {});
-          }
+          safePlay(video, 'attachPlaybackHold');
         }
       } catch (e) {
-        /* ignore */
+        console.warn('PopoutPlayer: tryResumeOnce failed', e);
       }
     }
 
@@ -1100,53 +1181,56 @@
       if (!info.keepPlayingIntent) {
         return;
       }
-      window.setTimeout(tryResumeOnce, 0);
-      window.setTimeout(tryResumeOnce, 30);
-      window.setTimeout(tryResumeOnce, 100);
-      window.setTimeout(tryResumeOnce, 250);
+      // Use constants for retry delays
+      CONSTANTS.RESUME_RETRY_DELAYS.forEach(function(delay) {
+        window.setTimeout(tryResumeOnce, delay);
+      });
     }
 
     function onVisibilityChange() {
       if (!info.keepPlayingIntent || !document.hidden) {
         return;
       }
-      window.setTimeout(tryResumeOnce, 0);
-      window.setTimeout(tryResumeOnce, 80);
+      // Use constants for retry delays
+      CONSTANTS.VISIBILITY_RETRY_DELAYS.forEach(function(delay) {
+        window.setTimeout(tryResumeOnce, delay);
+      });
     }
 
     video.addEventListener('pause', onSourcePause);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
-    let holdIntervalId = 0;
+    // Store interval in info object for reliable cleanup
+    info.holdIntervalId = 0;
     if (wasPlayingBeforePopout) {
       let ticks = 0;
-      holdIntervalId = window.setInterval(function () {
+      info.holdIntervalId = window.setInterval(function () {
         if (!activePopouts.has(videoId) || popup.closed) {
-          window.clearInterval(holdIntervalId);
-          holdIntervalId = 0;
+          window.clearInterval(info.holdIntervalId);
+          info.holdIntervalId = 0;
           return;
         }
         if (!info.keepPlayingIntent) {
-          window.clearInterval(holdIntervalId);
-          holdIntervalId = 0;
+          window.clearInterval(info.holdIntervalId);
+          info.holdIntervalId = 0;
           return;
         }
         if (video.paused) {
           tryResumeOnce();
         }
-        if (++ticks > 300) {
-          window.clearInterval(holdIntervalId);
-          holdIntervalId = 0;
+        if (++ticks > CONSTANTS.PLAYBACK_HOLD_MAX_TICKS) {
+          window.clearInterval(info.holdIntervalId);
+          info.holdIntervalId = 0;
         }
-      }, 100);
+      }, CONSTANTS.PLAYBACK_HOLD_POLL_MS);
     }
 
     info.releasePlaybackHold = function () {
       video.removeEventListener('pause', onSourcePause);
       document.removeEventListener('visibilitychange', onVisibilityChange);
-      if (holdIntervalId) {
-        window.clearInterval(holdIntervalId);
-        holdIntervalId = 0;
+      if (info.holdIntervalId) {
+        window.clearInterval(info.holdIntervalId);
+        info.holdIntervalId = 0;
       }
     };
 
@@ -1269,7 +1353,7 @@
     const titleIcon = doc.createElement('span');
     titleIcon.className = 'popout-titlebar-icon';
     titleIcon.setAttribute('aria-hidden', 'true');
-    titleIcon.innerHTML = ICONS.pip;
+    titleIcon.appendChild(createSVGElement(ICONS.pip));
 
     const titleText = doc.createElement('span');
     titleText.className = 'popout-titlebar-title';
@@ -1279,7 +1363,7 @@
     titleBarCloseBtn.type = 'button';
     titleBarCloseBtn.className = 'popout-titlebar-close';
     titleBarCloseBtn.setAttribute('aria-label', 'Close and restore video');
-    titleBarCloseBtn.innerHTML = ICONS.close;
+    titleBarCloseBtn.appendChild(createSVGElement(ICONS.close));
     titleBarCloseBtn.title = 'Close and restore video';
 
     titleBar.appendChild(titleIcon);
@@ -1373,7 +1457,7 @@
     // Controls container
     const controls = doc.createElement('div');
     controls.className = 'controls';
-    controls.style.zIndex = '2147483647';
+    controls.style.zIndex = String(CONSTANTS.Z_INDEX_CONTROLS);
 
     // Progress bar container
     const progressContainer = doc.createElement('div');
@@ -1407,20 +1491,23 @@
 
     const skipBackBtn = doc.createElement('button');
     skipBackBtn.className = 'control-btn';
-    skipBackBtn.innerHTML = ICONS.skipBack;
+    skipBackBtn.appendChild(createSVGElement(ICONS.skipBack));
     skipBackBtn.title = 'Skip back 10s';
+    skipBackBtn.setAttribute('aria-label', 'Skip back 10 seconds');
     leftControls.appendChild(skipBackBtn);
 
     const playPauseBtn = doc.createElement('button');
     playPauseBtn.className = 'control-btn play-pause';
-    playPauseBtn.innerHTML = video.paused ? ICONS.play : ICONS.pause;
+    playPauseBtn.appendChild(createSVGElement(video.paused ? ICONS.play : ICONS.pause));
     playPauseBtn.title = 'Play/Pause (Space)';
+    playPauseBtn.setAttribute('aria-label', video.paused ? 'Play' : 'Pause');
     leftControls.appendChild(playPauseBtn);
 
     const skipForwardBtn = doc.createElement('button');
     skipForwardBtn.className = 'control-btn';
-    skipForwardBtn.innerHTML = ICONS.skipForward;
+    skipForwardBtn.appendChild(createSVGElement(ICONS.skipForward));
     skipForwardBtn.title = 'Skip forward 10s';
+    skipForwardBtn.setAttribute('aria-label', 'Skip forward 10 seconds');
     leftControls.appendChild(skipForwardBtn);
 
     const timeDisplay = doc.createElement('span');
@@ -1436,9 +1523,11 @@
 
     const volumeBtn = doc.createElement('button');
     volumeBtn.className = 'control-btn';
-    volumeBtn.innerHTML =
-      prePopoutAudio.muted || prePopoutAudio.volume === 0 ? ICONS.volumeMute : ICONS.volumeUp;
+    volumeBtn.appendChild(createSVGElement(
+      prePopoutAudio.muted || prePopoutAudio.volume === 0 ? ICONS.volumeMute : ICONS.volumeUp
+    ));
     volumeBtn.title = 'Mute (M)';
+    volumeBtn.setAttribute('aria-label', prePopoutAudio.muted ? 'Unmute' : 'Mute');
     rightControls.appendChild(volumeBtn);
 
     const volumeSlider = doc.createElement('input');
@@ -1447,12 +1536,18 @@
     volumeSlider.min = '0';
     volumeSlider.max = '100';
     volumeSlider.value = String(Math.round(prePopoutAudio.volume * 100));
+    volumeSlider.setAttribute('aria-label', 'Volume');
+    volumeSlider.setAttribute('aria-valuemin', '0');
+    volumeSlider.setAttribute('aria-valuemax', '100');
+    volumeSlider.setAttribute('aria-valuenow', volumeSlider.value);
+    volumeSlider.setAttribute('aria-valuetext', volumeSlider.value + ' percent');
     rightControls.appendChild(volumeSlider);
 
     const navigateBackBtn = doc.createElement('button');
     navigateBackBtn.className = 'control-btn navigate-back';
-    navigateBackBtn.innerHTML = ICONS.back;
+    navigateBackBtn.appendChild(createSVGElement(ICONS.back));
     navigateBackBtn.title = 'Navigate back to source';
+    navigateBackBtn.setAttribute('aria-label', 'Navigate back to source');
     navigateBackBtn.textContent = 'Navigate Back';
     rightControls.appendChild(navigateBackBtn);
 
@@ -1533,12 +1628,9 @@
           try {
             displayVideo.muted = false;
           } catch (e) {
-            /* ignore */
+            console.warn('PopoutPlayer: displayVideo unmute failed', e);
           }
-          const p = displayVideo.play();
-          if (p && typeof p.catch === 'function') {
-            p.catch(function () {});
-          }
+          safePlay(displayVideo, 'syncMirrorPlayback');
         }
       }
       video.addEventListener('play', syncMirrorPlayback);
@@ -1628,11 +1720,17 @@
     });
 
     video.addEventListener('play', () => {
-      elements.playPauseBtn.innerHTML = ICONS.pause;
+      // Clear and update button content safely
+      elements.playPauseBtn.textContent = '';
+      elements.playPauseBtn.appendChild(createSVGElement(ICONS.pause));
+      elements.playPauseBtn.setAttribute('aria-label', 'Pause');
     });
 
     video.addEventListener('pause', () => {
-      elements.playPauseBtn.innerHTML = ICONS.play;
+      // Clear and update button content safely
+      elements.playPauseBtn.textContent = '';
+      elements.playPauseBtn.appendChild(createSVGElement(ICONS.play));
+      elements.playPauseBtn.setAttribute('aria-label', 'Play');
     });
 
     // Skip back/forward
@@ -1716,13 +1814,18 @@
       const silent =
         volumeTarget.muted ||
         (duckLevel != null ? logicalVolume < 0.001 : volumeTarget.volume < 0.001);
-      elements.volumeBtn.innerHTML = silent ? ICONS.volumeMute : ICONS.volumeUp;
+      // Clear and update button content safely
+      elements.volumeBtn.textContent = '';
+      elements.volumeBtn.appendChild(createSVGElement(silent ? ICONS.volumeMute : ICONS.volumeUp));
+      elements.volumeBtn.setAttribute('aria-label', silent ? 'Unmute' : 'Mute');
       if (!volumeTarget.muted) {
         if (duckLevel != null) {
           elements.volumeSlider.value = String(Math.round(logicalVolume * 100));
         } else {
           elements.volumeSlider.value = String(Math.round(volumeTarget.volume * 100));
         }
+        elements.volumeSlider.setAttribute('aria-valuenow', elements.volumeSlider.value);
+        elements.volumeSlider.setAttribute('aria-valuetext', elements.volumeSlider.value + ' percent');
       }
     }
 
@@ -1772,22 +1875,34 @@
     function togglePopoutFullscreen() {
       const doc = popup.document;
       const root = doc.documentElement;
-      const fsEl = doc.fullscreenElement || doc.webkitFullscreenElement;
+      const fsEl = getFullscreenElement(doc);
       try {
         if (fsEl) {
+          // Exit fullscreen with vendor prefixes
           if (doc.exitFullscreen) {
             doc.exitFullscreen();
           } else if (doc.webkitExitFullscreen) {
             doc.webkitExitFullscreen();
+          } else if (doc.mozCancelFullScreen) {
+            doc.mozCancelFullScreen();
+          } else if (doc.msExitFullscreen) {
+            doc.msExitFullscreen();
           }
         } else {
-          const req = root.requestFullscreen || root.webkitRequestFullscreen;
+          // Request fullscreen with vendor prefixes
+          const req = root.requestFullscreen || root.webkitRequestFullscreen ||
+                      root.mozRequestFullScreen || root.msRequestFullscreen;
           if (req) {
-            req.call(root, { navigationUI: 'hide' });
+            try {
+              req.call(root, { navigationUI: 'hide' });
+            } catch (e) {
+              // Retry without options for older browsers
+              req.call(root);
+            }
           }
         }
       } catch (err) {
-        /* PiP or policy may block fullscreen */
+        console.warn('PopoutPlayer: fullscreen toggle failed', err);
       }
     }
 
@@ -1805,17 +1920,23 @@
 
     // Keyboard shortcuts (click the popout once so it has focus for keys)
     function onKeydown(e) {
-      if (e.target.tagName === 'INPUT') return;
+      // Ignore keys when user is typing in editable elements
+      if (isEditableElement(e.target)) return;
 
       switch (e.key) {
         case 'Escape': {
           e.preventDefault();
           const doc = popup.document;
-          if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+          // Use utility function for cross-browser fullscreen support
+          if (getFullscreenElement(doc)) {
             if (doc.exitFullscreen) {
               doc.exitFullscreen();
             } else if (doc.webkitExitFullscreen) {
               doc.webkitExitFullscreen();
+            } else if (doc.mozCancelFullScreen) {
+              doc.mozCancelFullScreen();
+            } else if (doc.msExitFullscreen) {
+              doc.msExitFullscreen();
             }
           } else {
             popup.close();
@@ -1994,17 +2115,22 @@
       try {
         ro.observe(coverEl);
       } catch (e) {
-        /* ignore */
+        console.warn('PopoutPlayer: ResizeObserver failed', e);
       }
     }
     placeholder._ppCleanup = function () {
+      // Cancel pending animation frame to prevent callbacks after cleanup
+      if (raf) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      }
       window.removeEventListener('scroll', scheduleSync, true);
       window.removeEventListener('resize', scheduleSync);
       if (ro) {
         try {
           ro.disconnect();
         } catch (e2) {
-          /* ignore */
+          console.warn('PopoutPlayer: ResizeObserver disconnect failed', e2);
         }
       }
     };
@@ -2034,7 +2160,7 @@
         font-family: system-ui, -apple-system, sans-serif;
         border-radius: 8px;
         gap: 12px;
-        z-index: 2147483647;
+        z-index: ${CONSTANTS.Z_INDEX_OVERLAY};
         box-sizing: border-box;
         pointer-events: auto;
         isolation: isolate;
@@ -2233,7 +2359,7 @@
       padding: 14px 20px;
       border-radius: 8px;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-      z-index: 2147483647;
+      z-index: ${CONSTANTS.Z_INDEX_OVERLAY};
       font-family: system-ui, -apple-system, sans-serif;
       font-size: 14px;
       line-height: 1.4;
@@ -2280,7 +2406,7 @@
       padding: 16px 24px;
       border-radius: 8px;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-      z-index: 2147483647;
+      z-index: ${CONSTANTS.Z_INDEX_OVERLAY};
       font-family: system-ui, -apple-system, sans-serif;
       font-size: 14px;
       display: flex;
@@ -2415,6 +2541,12 @@
 
   // Cleanup function to remove overlay for a video
   function cleanupVideoOverlay(video) {
+    // Prevent double-cleanup using WeakSet
+    if (cleanedVideos.has(video)) {
+      return;
+    }
+    cleanedVideos.add(video);
+
     const cleanup = videoCleanupFunctions.get(video);
     if (cleanup) {
       try {
@@ -2431,30 +2563,50 @@
     const videos = findAllVideos();
     videos.forEach(processVideo);
 
-    // Watch for new videos and removed videos
+    // Watch for new videos and removed videos with error boundaries
     const observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
-        // Handle added nodes
+        // Handle added nodes with error boundary
         for (const node of mutation.addedNodes) {
           if (node.nodeType === Node.ELEMENT_NODE) {
-            if (node.tagName === 'VIDEO') {
-              processVideo(node);
-            } else {
-              const videos = findAllVideos(node);
-              videos.forEach(processVideo);
+            try {
+              if (node.tagName === 'VIDEO') {
+                processVideo(node);
+              } else {
+                const videos = findAllVideos(node);
+                videos.forEach(function(video) {
+                  try {
+                    processVideo(video);
+                  } catch (err) {
+                    console.error('PopoutPlayer: processVideo failed', err);
+                  }
+                });
+              }
+            } catch (err) {
+              console.error('PopoutPlayer: MutationObserver addedNodes processing failed', err);
             }
           }
         }
 
-        // Handle removed nodes - cleanup overlays for removed videos
+        // Handle removed nodes - cleanup overlays for removed videos with error boundary
         for (const node of mutation.removedNodes) {
           if (node.nodeType === Node.ELEMENT_NODE) {
-            if (node.tagName === 'VIDEO') {
-              cleanupVideoOverlay(node);
-            } else if (node.querySelector) {
-              // Check if the removed subtree contained any videos with overlays
-              const videos = node.querySelectorAll('video');
-              videos.forEach(cleanupVideoOverlay);
+            try {
+              if (node.tagName === 'VIDEO') {
+                cleanupVideoOverlay(node);
+              } else if (node.querySelector) {
+                // Check if the removed subtree contained any videos with overlays
+                const videos = node.querySelectorAll('video');
+                videos.forEach(function(video) {
+                  try {
+                    cleanupVideoOverlay(video);
+                  } catch (err) {
+                    console.error('PopoutPlayer: cleanupVideoOverlay failed', err);
+                  }
+                });
+              }
+            } catch (err) {
+              console.error('PopoutPlayer: MutationObserver removedNodes processing failed', err);
             }
           }
         }
@@ -2466,17 +2618,16 @@
       subtree: true
     });
 
-    // Cleanup all overlays when the page unloads
-    window.addEventListener('beforeunload', () => {
+    // Cleanup all overlays when the page unloads (idempotent - uses cleanedVideos WeakSet)
+    function cleanupAllVideos() {
       const allVideos = findAllVideos();
       allVideos.forEach(cleanupVideoOverlay);
-    });
+    }
 
+    window.addEventListener('beforeunload', cleanupAllVideos);
     // Also cleanup on pagehide (more reliable for some browsers)
-    window.addEventListener('pagehide', () => {
-      const allVideos = findAllVideos();
-      allVideos.forEach(cleanupVideoOverlay);
-    });
+    // The cleanedVideos WeakSet prevents double-cleanup
+    window.addEventListener('pagehide', cleanupAllVideos);
   }
 
   // Start when DOM is ready
